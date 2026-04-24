@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 description = "Evolve CLI — drop-in passive evolution for AI coding assistants"
 
+[lib]
+name = "evolve_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "evolve"
 path = "src/main.rs"
@@ -17,10 +21,13 @@ evolve-adapters = { path = "../evolve-adapters", version = "0.2.0" }
 evolve-core = { path = "../evolve-core", version = "0.2.0" }
 evolve-dashboard = { path = "../evolve-dashboard", version = "0.2.0" }
 evolve-llm = { path = "../evolve-llm", version = "0.2.0" }
+evolve-mutators = { path = "../evolve-mutators", version = "0.2.0" }
 evolve-proxy = { path = "../evolve-proxy", version = "0.2.0" }
 evolve-storage = { path = "../evolve-storage", version = "0.2.0" }
 clap.workspace = true
 dirs.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -29,3 +36,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

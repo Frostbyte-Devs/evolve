@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Evolution loop is wired up.** `evolve record-*` now actually evolves:
+  after recording a session, the CLI calls into a new `evolve_cli::engine`
+  module that (a) checks whether a running experiment should promote, hold,
+  or wait for more data via `promotion_decision`, and (b) if no experiment
+  is running and the session count threshold is hit, generates a challenger
+  via `MutatorPicker` + `pick_default_client`, persists the challenger
+  config, opens a new `Experiment` row, and re-applies the challenger to
+  disk through the adapter. **In v0.1.0-rc.1 these primitives existed but
+  were not connected; sessions were recorded but the champion never
+  changed.** That gap is closed.
+- **`evolve roll`** subcommand: force-generates a challenger right now,
+  bypassing the schedule. Useful when iterating on mutation operators
+  or testing the loop end-to-end.
+- **End-to-end integration tests** (`tests/end_to_end.rs`) prove a
+  champion-vs-challenger A/B test where the challenger has 92% success
+  rate vs champion's 20% triggers `Decision::Promote` and swaps the
+  project's champion pointer. The mirror test (challenger underperforms)
+  asserts `Decision::Hold`. These are the regression guards that should
+  have existed before claiming v0.1.0 worked.
 - **Claude Code: subagent signal extraction.** Transcript parser now
   recognizes `"type": "subagent"` events and emits `subagent_ok` (1.0) or
   `subagent_fail` (0.0) signals, tagged with the subagent type in the

@@ -1,5 +1,7 @@
 //! evolve CLI — user-facing binary.
 
+use evolve_cli::engine;
+
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -8,11 +10,14 @@ use evolve_adapters::{
 };
 use evolve_core::agent_config::AgentConfig;
 use evolve_core::ids::{AdapterId, ConfigId, ProjectId, SessionId, SignalId};
+use evolve_core::promotion::Decision;
 use evolve_storage::Storage;
 use evolve_storage::agent_configs::{AgentConfigRepo, AgentConfigRow, ConfigRole};
 use evolve_storage::projects::{Project, ProjectRepo};
-use evolve_storage::sessions::{Session, SessionRepo, SessionVariant};
+use evolve_storage::sessions::{Session, SessionRepo};
 use evolve_storage::signals::{Signal, SignalKind, SignalRepo};
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -70,6 +75,8 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Force-generate a new challenger now (skip the schedule).
+    Roll,
     /// Start the local dashboard (http://127.0.0.1:<port>).
     Dashboard {
         /// TCP port. Default 8787.
@@ -139,6 +146,7 @@ async fn main() -> Result<()> {
         Command::Forget { project_id, all } => {
             cmd_forget(&storage, &registry, project_id, all).await
         }
+        Command::Roll => cmd_roll(&storage, &registry).await,
         Command::Dashboard { port } => cmd_dashboard(storage, port).await,
         Command::Proxy { adapter, port } => cmd_proxy(&storage, &adapter, port).await,
     }
@@ -288,20 +296,21 @@ async fn cmd_record(
         .into_iter()
         .find(|p| p.adapter_id.as_str() == adapter_id)
         .context("no projects registered for this adapter; run `evolve init` first")?;
-    let config_id = project
-        .champion_config_id
-        .context("project has no champion config")?;
+
+    // Resolve which variant + config + experiment this session belongs to.
+    let (variant, config_id, experiment_id) =
+        engine::resolve_active_deployment(storage, &project).await?;
 
     let parsed = adapter.parse_session(log).await?;
 
-    // Insert Session.
+    // Insert Session tagged with the active deployment.
     let session_id = SessionId::new();
     SessionRepo::new(storage)
         .insert(&Session {
             id: session_id,
             project_id: project.id,
-            experiment_id: None,
-            variant: SessionVariant::Champion,
+            experiment_id,
+            variant,
             config_id,
             started_at: Utc::now(),
             ended_at: Utc::now(),
@@ -326,8 +335,74 @@ async fn cmd_record(
             })
             .await?;
     }
-
     println!("Recorded session {session_id}");
+
+    // ---- the actual evolution loop ----
+
+    // 1) If an experiment is running, evaluate the promotion posterior.
+    if let Some((exp, decision)) = engine::evaluate_promotion(storage, project.id).await? {
+        match decision {
+            Decision::Promote { posterior } => {
+                engine::promote_challenger(storage, registry, &project, &exp, posterior).await?;
+                println!(
+                    "Promoted challenger {} (posterior {:.3})",
+                    exp.challenger_config_id, posterior
+                );
+            }
+            Decision::Hold { posterior } => {
+                tracing::debug!(target: "evolve::engine", "experiment holding at posterior {posterior:.3}");
+            }
+            Decision::NeedMoreData {
+                sessions_each,
+                required,
+            } => {
+                tracing::debug!(
+                    target: "evolve::engine",
+                    "experiment needs more data ({sessions_each}/{required} per arm)"
+                );
+            }
+        }
+    } else if engine::should_evolve(storage, project.id, 20).await? {
+        // 2) No running experiment + threshold reached → spin up a challenger.
+        match evolve_llm::pick_default_client().await {
+            Ok(llm) => {
+                let mut rng = ChaCha8Rng::from_entropy();
+                match engine::generate_challenger(storage, registry, &*llm, &project, &mut rng)
+                    .await
+                {
+                    Ok((cid, eid)) => {
+                        println!("Generated challenger {cid} in experiment {eid}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "evolve::engine", "challenger generation failed: {e}")
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "evolve::engine",
+                    "no LLM available, skipping challenger generation: {e}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_roll(storage: &Storage, registry: &AdapterRegistry) -> Result<()> {
+    let projects = ProjectRepo::new(storage).list().await?;
+    let project = projects
+        .into_iter()
+        .next()
+        .context("no projects registered; run `evolve init` first")?;
+    let llm = evolve_llm::pick_default_client()
+        .await
+        .context("no LLM available — set ANTHROPIC_API_KEY or run Ollama locally")?;
+    let mut rng = ChaCha8Rng::from_entropy();
+    let (cid, eid) =
+        engine::generate_challenger(storage, registry, &*llm, &project, &mut rng).await?;
+    println!("Generated challenger {cid} in experiment {eid}");
     Ok(())
 }
 
