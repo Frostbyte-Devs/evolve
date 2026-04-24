@@ -259,3 +259,77 @@ mod tests {
         assert!(value.is_none());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::{btree_map, btree_set};
+    use proptest::prelude::*;
+
+    fn arb_model_pref() -> impl Strategy<Value = ModelPref> {
+        prop_oneof![
+            Just(ModelPref::ClaudeOpus),
+            Just(ModelPref::ClaudeSonnet),
+            Just(ModelPref::ClaudeHaiku),
+            Just(ModelPref::Gpt4o),
+            Just(ModelPref::Gpt4oMini),
+            Just(ModelPref::AnyCheap),
+            "[a-z][a-z0-9.:-]{2,15}".prop_map(ModelPref::Ollama),
+        ]
+    }
+
+    fn arb_response_style() -> impl Strategy<Value = ResponseStyle> {
+        prop_oneof![
+            Just(ResponseStyle::Terse),
+            Just(ResponseStyle::Normal),
+            Just(ResponseStyle::Verbose),
+        ]
+    }
+
+    fn arb_agent_config() -> impl Strategy<Value = AgentConfig> {
+        (
+            "[ -~]{0,200}",                               // system_prompt_prefix
+            arb_model_pref(),                             // model_pref
+            btree_set("[a-z ]{1,30}", 0..6),              // behavioral_rules
+            btree_set("[a-z_]{1,15}", 0..6),              // tool_permissions
+            arb_response_style(),                         // response_style
+            btree_map("[a-z]{1,10}", any::<i32>(), 0..3), // extensions (typed as i32 for simplicity)
+        )
+            .prop_map(|(prefix, model, rules, perms, style, ext_raw)| {
+                let extensions = ext_raw
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::from(v)))
+                    .collect();
+                AgentConfig {
+                    system_prompt_prefix: prefix,
+                    model_pref: model,
+                    behavioral_rules: rules,
+                    tool_permissions: perms,
+                    response_style: style,
+                    extensions,
+                }
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn json_roundtrip_is_identity(cfg in arb_agent_config()) {
+            let json = serde_json::to_string(&cfg).unwrap();
+            let back: AgentConfig = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(cfg, back);
+        }
+
+        #[test]
+        fn fingerprint_invariant_under_json_roundtrip(cfg in arb_agent_config()) {
+            let json = serde_json::to_string(&cfg).unwrap();
+            let back: AgentConfig = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(cfg.fingerprint(), back.fingerprint());
+        }
+
+        #[test]
+        fn equal_configs_have_equal_fingerprints(cfg in arb_agent_config()) {
+            let twin = cfg.clone();
+            prop_assert_eq!(cfg.fingerprint(), twin.fingerprint());
+        }
+    }
+}
