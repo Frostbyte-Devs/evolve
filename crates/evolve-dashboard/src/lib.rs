@@ -14,6 +14,7 @@ use axum::{
     routing::get,
 };
 use evolve_storage::Storage;
+use evolve_storage::experiments::ExperimentRepo;
 use evolve_storage::projects::ProjectRepo;
 use evolve_storage::sessions::SessionRepo;
 use rust_embed::RustEmbed;
@@ -39,6 +40,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/projects", get(list_projects))
         .route("/api/projects/{id}", get(get_project))
         .route("/api/projects/{id}/sessions", get(project_sessions))
+        .route(
+            "/api/projects/{id}/experiment",
+            get(project_running_experiment),
+        )
+        .route(
+            "/api/projects/{id}/promotion-log",
+            get(project_promotion_log),
+        )
         .route("/healthz", get(|| async { "ok" }))
         .fallback(static_handler)
         .with_state(state)
@@ -118,6 +127,65 @@ async fn get_project(State(state): State<AppState>, AxumPath(id): AxumPath<Strin
         }))
         .into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn project_running_experiment(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let pid = match uuid::Uuid::parse_str(&id).map(evolve_core::ids::ProjectId::from_uuid) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match ExperimentRepo::new(&state.storage)
+        .get_running_for_project(pid)
+        .await
+    {
+        Ok(Some(exp)) => Json(json!({
+            "id": exp.id.to_string(),
+            "champion_config_id": exp.champion_config_id.to_string(),
+            "challenger_config_id": exp.challenger_config_id.to_string(),
+            "traffic_share": exp.traffic_share,
+            "started_at": exp.started_at,
+        }))
+        .into_response(),
+        Ok(None) => Json(json!(null)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn project_promotion_log(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let pid = match uuid::Uuid::parse_str(&id).map(evolve_core::ids::ProjectId::from_uuid) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match ExperimentRepo::new(&state.storage)
+        .list_completed(pid)
+        .await
+    {
+        Ok(rows) => {
+            let payload: Vec<_> = rows
+                .into_iter()
+                .map(|exp| {
+                    json!({
+                        "id": exp.id.to_string(),
+                        "champion_config_id": exp.champion_config_id.to_string(),
+                        "challenger_config_id": exp.challenger_config_id.to_string(),
+                        "status": format!("{:?}", exp.status),
+                        "traffic_share": exp.traffic_share,
+                        "started_at": exp.started_at,
+                        "decided_at": exp.decided_at,
+                        "decision_posterior": exp.decision_posterior,
+                    })
+                })
+                .collect();
+            Json(payload).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
