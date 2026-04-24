@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod client;
 pub mod error;
 
+pub use client::{CompletionResult, LlmClient, TokenUsage};
 pub use error::LlmError;
