@@ -6,9 +6,11 @@
 pub mod anthropic;
 pub mod client;
 pub mod error;
+pub mod factory;
 pub mod ollama;
 
 pub use anthropic::AnthropicHaikuClient;
 pub use client::{CompletionResult, LlmClient, TokenUsage};
 pub use error::LlmError;
+pub use factory::pick_default_client;
 pub use ollama::OllamaClient;

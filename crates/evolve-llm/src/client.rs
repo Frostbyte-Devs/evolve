@@ -23,7 +23,7 @@ pub struct CompletionResult {
 
 /// Shared interface for LLM clients.
 #[async_trait]
-pub trait LlmClient: Send + Sync {
+pub trait LlmClient: Send + Sync + std::fmt::Debug {
     /// Run a single non-streaming completion.
     async fn complete(&self, prompt: &str, max_tokens: u32) -> Result<CompletionResult, LlmError>;
 
