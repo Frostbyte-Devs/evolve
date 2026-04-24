@@ -9,8 +9,8 @@ src = "src"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/NORTHTEKDevs/evolve"
-edit-url-template = "https://github.com/NORTHTEKDevs/evolve/edit/main/docs/book/{path}"
+git-repository-url = "https://github.com/Frostbyte-Devs/evolve"
+edit-url-template = "https://github.com/Frostbyte-Devs/evolve/edit/main/docs/book/{path}"
 
 [output.html.fold]
 enable = true
