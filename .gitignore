@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+.env
+.env.local
+*.log
+/runs/
+.DS_Store
+node_modules/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+dist/
