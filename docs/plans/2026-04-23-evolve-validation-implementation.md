@@ -143,20 +143,2111 @@ Tests: roundtrip serde, fingerprint stable across clones, fingerprint differs wh
 
 # PHASE 2 — SQLite Storage (`evolve-storage`)
 
-**Goal:** Embedded SQLite at `~/.evolve/evolve.db` with `projects`, `agent_configs`, `experiments`, `sessions`, `signals` tables. Repository pattern over sqlx. Migrations via `sqlx migrate`.
+**Goal:** Embedded SQLite at `~/.evolve/evolve.db` with `projects`, `agent_configs`, `experiments`, `sessions`, `signals` tables. Repository pattern over sqlx. Migrations embedded via `sqlx::migrate!` macro.
 
-**Tasks:**
+## Phase 2 Design Decisions (binding for all tasks below)
 
-- 2.1 — Create `crates/evolve-storage/` (Cargo.toml + src/lib.rs). Add to workspace.
-- 2.2 — Write SQL migration `0001_init.sql` defining all 5 tables with PK/FK/indexes. Include explicit UNIQUE constraints (e.g., one running experiment per project).
-- 2.3 — `Storage` struct wrapping `SqlitePool`. `Storage::open(path)` and `Storage::migrate()`.
-- 2.4 — `ProjectRepo` (insert, get_by_id, get_by_root_path, list, delete).
-- 2.5 — `AgentConfigRepo` (insert, get_by_id, latest_for_project_role).
-- 2.6 — `ExperimentRepo` (insert, get_running_for_project, list_completed, update_status).
-- 2.7 — `SessionRepo` (insert, list_recent, list_for_experiment).
-- 2.8 — `SignalRepo` (insert, list_for_session, list_for_config).
-- 2.9 — Integration tests against `sqlite::memory:` covering each repo.
-- 2.10 — Schema-survives-restart test: open→write→drop→reopen→read same data.
+- **sqlx features:** `runtime-tokio`, `sqlite`, `macros`, `migrate`, `chrono`. *Not* the `uuid` feature — we bind UUIDs as `TEXT` (canonical hyphenated form) for human-readable `sqlite3` CLI inspection.
+- **Timestamps:** `chrono::DateTime<Utc>` serialized as ISO 8601 `TEXT`. Add `chrono = { version = "0.4", features = ["serde"] }` to workspace.
+- **UUIDs in DB:** stored as `TEXT`. Bind via `id.to_string()`, read via `Uuid::parse_str(...)`.
+- **`u64` fingerprint in DB:** stored as `INTEGER` via `fingerprint as i64` bit-cast (two-way unambiguous). Document at the call sites.
+- **Connection mode:** `sqlx::SqlitePool` with `create_if_missing(true)` + `foreign_keys = ON` pragma enforced at connect time.
+- **In-memory test handle:** `Storage::in_memory_for_tests()` → `SqlitePool` against `sqlite::memory:` with migrations pre-applied. Every repo test uses this.
+- **Error type:** crate-local `StorageError` via `thiserror` wrapping `sqlx::Error`, `serde_json::Error`, and `uuid::Error`.
+- **Privacy invariant (enforced by Task 2.9 tests):** the `signals.payload_json` column MUST NOT contain code-like content. Tests validate by regex against inserted rows.
+
+## Task 2.1 — Create `evolve-storage` crate skeleton
+
+**Files:**
+- Create: `crates/evolve-storage/Cargo.toml`
+- Create: `crates/evolve-storage/src/lib.rs`
+- Create: `crates/evolve-storage/migrations/` (empty dir with `.gitkeep`)
+- Modify: `Cargo.toml` (workspace root — add member + chrono + sqlx to workspace deps)
+
+**Step 1: Add `chrono` and `sqlx` to workspace.dependencies**
+
+Edit the root `Cargo.toml`, inside `[workspace.dependencies]`, append:
+
+```toml
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+tempfile = "3"
+```
+
+Also add `"crates/evolve-storage"` to `[workspace] members`.
+
+**Step 2: Create `crates/evolve-storage/Cargo.toml`**
+
+```toml
+[package]
+name = "evolve-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite persistence for Evolve (projects, configs, experiments, sessions, signals)"
+
+[dependencies]
+evolve-core = { path = "../evolve-core" }
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+```
+
+**Step 3: Create `crates/evolve-storage/src/lib.rs`**
+
+```rust
+//! evolve-storage: SQLite persistence for Evolve.
+//!
+//! Opens a single database at the configured path (default `~/.evolve/evolve.db`),
+//! applies embedded migrations, and exposes repository structs per table.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod error;
+pub mod pool;
+
+pub use error::StorageError;
+pub use pool::Storage;
+```
+
+**Step 4: Create `crates/evolve-storage/migrations/.gitkeep`** (empty file so the directory is tracked).
+
+**Step 5: Stub `src/error.rs` and `src/pool.rs` so the crate compiles**
+
+`src/error.rs`:
+```rust
+//! Unified error type for the storage crate.
+
+use thiserror::Error;
+
+/// Errors produced by [`Storage`](crate::Storage) and its repositories.
+#[derive(Debug, Error)]
+pub enum StorageError {
+    /// An underlying sqlx error (connection, query, migration).
+    #[error("sqlx: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    /// A JSON serialization error on a payload column.
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    /// A migration error from `sqlx::migrate!`.
+    #[error("migrate: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    /// Failed to parse a UUID from a TEXT column.
+    #[error("uuid: {0}")]
+    Uuid(#[from] uuid::Error),
+}
+```
+
+`src/pool.rs`:
+```rust
+//! Connection pool + migration runner.
+
+use crate::error::StorageError;
+
+/// Handle to the SQLite database. Cheap to clone (wraps a `SqlitePool`).
+#[derive(Debug, Clone)]
+pub struct Storage {
+    pool: sqlx::SqlitePool,
+}
+
+impl Storage {
+    /// Borrow the underlying pool. Repositories take this by reference.
+    pub fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
+    }
+
+    /// Placeholder so the crate compiles before Task 2.3 wires this up.
+    #[allow(dead_code)]
+    pub(crate) fn from_pool(pool: sqlx::SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Silence unused-error warnings until Task 2.3 fills this in.
+    #[allow(dead_code)]
+    fn _unused_error_shape(_e: StorageError) {}
+}
+```
+
+**Step 6: Verify**
+
+Run: `cargo check -p evolve-storage`
+Expected: compiles clean, no warnings.
+
+Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: clean.
+
+**Step 7: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock crates/evolve-storage
+git commit -m "feat(storage): scaffold evolve-storage crate with error type"
+```
+
+## Task 2.2 — Initial migration `0001_init.sql`
+
+**Files:**
+- Create: `crates/evolve-storage/migrations/0001_init.sql`
+
+**Step 1: Write the migration**
+
+```sql
+-- 0001_init.sql: initial schema for evolve-storage
+-- All ids stored as TEXT (UUID hyphenated) except adapter_id which is free-form TEXT.
+-- All timestamps stored as TEXT (ISO 8601 UTC).
+
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE projects (
+    id                   TEXT PRIMARY KEY NOT NULL,
+    adapter_id           TEXT NOT NULL,
+    root_path            TEXT NOT NULL UNIQUE,
+    name                 TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    champion_config_id   TEXT,
+    FOREIGN KEY (champion_config_id) REFERENCES agent_configs(id) DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE agent_configs (
+    id             TEXT PRIMARY KEY NOT NULL,
+    project_id     TEXT NOT NULL,
+    adapter_id     TEXT NOT NULL,
+    role           TEXT NOT NULL CHECK (role IN ('champion','challenger','historical')),
+    fingerprint    INTEGER NOT NULL,
+    payload_json   TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_agent_configs_project_role_created
+    ON agent_configs(project_id, role, created_at DESC);
+
+CREATE TABLE experiments (
+    id                      TEXT PRIMARY KEY NOT NULL,
+    project_id              TEXT NOT NULL,
+    champion_config_id      TEXT NOT NULL,
+    challenger_config_id    TEXT NOT NULL,
+    status                  TEXT NOT NULL CHECK (status IN ('running','promoted','aborted','held')),
+    traffic_share           REAL NOT NULL CHECK (traffic_share >= 0.0 AND traffic_share <= 1.0),
+    started_at              TEXT NOT NULL,
+    decided_at              TEXT,
+    decision_posterior      REAL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (champion_config_id) REFERENCES agent_configs(id),
+    FOREIGN KEY (challenger_config_id) REFERENCES agent_configs(id)
+);
+-- At most one running experiment per project (partial unique index).
+CREATE UNIQUE INDEX uniq_running_experiment_per_project
+    ON experiments(project_id)
+    WHERE status = 'running';
+CREATE INDEX idx_experiments_project_status
+    ON experiments(project_id, status);
+
+CREATE TABLE sessions (
+    id                      TEXT PRIMARY KEY NOT NULL,
+    project_id              TEXT NOT NULL,
+    experiment_id           TEXT,
+    variant                 TEXT NOT NULL CHECK (variant IN ('champion','challenger')),
+    config_id               TEXT NOT NULL,
+    started_at              TEXT NOT NULL,
+    ended_at                TEXT NOT NULL,
+    adapter_session_ref     TEXT,
+    FOREIGN KEY (project_id)   REFERENCES projects(id)      ON DELETE CASCADE,
+    FOREIGN KEY (experiment_id) REFERENCES experiments(id)  ON DELETE SET NULL,
+    FOREIGN KEY (config_id)    REFERENCES agent_configs(id)
+);
+CREATE INDEX idx_sessions_project_started
+    ON sessions(project_id, started_at DESC);
+CREATE INDEX idx_sessions_experiment
+    ON sessions(experiment_id);
+
+CREATE TABLE signals (
+    id              TEXT PRIMARY KEY NOT NULL,
+    session_id      TEXT NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('explicit','implicit')),
+    source          TEXT NOT NULL,
+    value           REAL NOT NULL CHECK (value >= 0.0 AND value <= 1.0),
+    recorded_at     TEXT NOT NULL,
+    payload_json    TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_signals_session ON signals(session_id);
+```
+
+**Step 2: Verify the file parses as valid SQLite (sanity check)**
+
+Run: `sqlite3 :memory: < crates/evolve-storage/migrations/0001_init.sql`
+Expected: no output, exit code 0.
+(If `sqlite3` CLI is unavailable, skip — Task 2.3 will exercise this via sqlx.)
+
+**Step 3: Commit**
+
+```bash
+git add crates/evolve-storage/migrations/0001_init.sql
+git commit -m "feat(storage): initial migration with projects/configs/experiments/sessions/signals"
+```
+
+## Task 2.3 — `Storage::open`, `migrate`, `in_memory_for_tests`
+
+**Files:**
+- Modify: `crates/evolve-storage/src/pool.rs`
+
+**Step 1: Write the failing test (append to `pool.rs`)**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn in_memory_storage_applies_migrations() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        // After migrations, `projects` table must exist.
+        let exists: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(exists.0, 1);
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_pragma_is_enabled() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let fk: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(fk.0, 1, "foreign_keys pragma must be ON");
+    }
+
+    #[tokio::test]
+    async fn all_five_tables_exist_after_migration() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let names: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        )
+        .fetch_all(storage.pool())
+        .await
+        .unwrap();
+        let got: Vec<&str> = names.iter().map(|(n,)| n.as_str()).collect();
+        for expected in ["agent_configs", "experiments", "projects", "sessions", "signals"] {
+            assert!(
+                got.contains(&expected),
+                "missing table {expected}; got {got:?}",
+            );
+        }
+    }
+}
+```
+
+**Step 2: Run the tests — expected fail**
+
+Run: `cargo test -p evolve-storage`
+Expected: compile error (`Storage::in_memory_for_tests` does not exist).
+
+**Step 3: Implement `Storage::open`, `migrate`, `in_memory_for_tests`**
+
+Replace the body of `pool.rs` above the tests module with:
+
+```rust
+//! Connection pool + migration runner.
+
+use crate::error::StorageError;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::path::Path;
+use std::str::FromStr;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Handle to the SQLite database. Cheap to clone (wraps a `SqlitePool`).
+#[derive(Debug, Clone)]
+pub struct Storage {
+    pool: sqlx::SqlitePool,
+}
+
+impl Storage {
+    /// Open the database at `path`, creating it if missing. Applies all
+    /// embedded migrations before returning.
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let url = format!("sqlite://{}", path.as_ref().display());
+        let options = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+        MIGRATOR.run(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// Open a fresh in-memory database with all migrations applied.
+    /// Useful only in tests.
+    pub async fn in_memory_for_tests() -> Result<Self, StorageError> {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1) // single connection for in-memory (per-conn DBs)
+            .connect_with(options)
+            .await?;
+        MIGRATOR.run(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// Borrow the underlying pool. Repositories take this by reference.
+    pub fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
+    }
+}
+```
+
+**Step 4: Run the tests — expected pass**
+
+Run: `cargo test -p evolve-storage`
+Expected: 3 tests pass.
+
+**Step 5: Lint gates**
+
+Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: clean.
+
+**Step 6: Commit**
+
+```bash
+git add crates/evolve-storage/src/pool.rs
+git commit -m "feat(storage): Storage::open and in-memory test helper with migration runner"
+```
+
+## Task 2.4 — `ProjectRepo`
+
+**Files:**
+- Create: `crates/evolve-storage/src/projects.rs`
+- Modify: `crates/evolve-storage/src/lib.rs` (add `pub mod projects;`)
+
+**Step 1: Write the failing tests in `projects.rs`**
+
+```rust
+//! Repository for the `projects` table.
+
+use crate::error::StorageError;
+use crate::pool::Storage;
+use chrono::{DateTime, Utc};
+use evolve_core::ids::{AdapterId, ConfigId, ProjectId};
+use uuid::Uuid;
+
+/// Row in the `projects` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Project {
+    /// Project identity.
+    pub id: ProjectId,
+    /// Adapter that manages this project ("claude-code", "cursor", "aider").
+    pub adapter_id: AdapterId,
+    /// Canonical absolute path to the project root.
+    pub root_path: String,
+    /// Human-readable name (usually the basename of `root_path`).
+    pub name: String,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Current champion config id; `None` only during `init` before the first
+    /// AgentConfig row has been written.
+    pub champion_config_id: Option<ConfigId>,
+}
+
+/// Repository for `projects`.
+#[derive(Debug, Clone)]
+pub struct ProjectRepo<'a> {
+    storage: &'a Storage,
+}
+
+impl<'a> ProjectRepo<'a> {
+    /// Construct a new repo borrowing the storage handle.
+    pub fn new(storage: &'a Storage) -> Self {
+        Self { storage }
+    }
+
+    /// Insert a new project row. Caller supplies the id.
+    pub async fn insert(&self, project: &Project) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO projects
+                (id, adapter_id, root_path, name, created_at, champion_config_id)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(project.id.to_string())
+        .bind(project.adapter_id.as_str())
+        .bind(&project.root_path)
+        .bind(&project.name)
+        .bind(project.created_at.to_rfc3339())
+        .bind(project.champion_config_id.map(|c| c.to_string()))
+        .execute(self.storage.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch by id; returns `Ok(None)` if no row matches.
+    pub async fn get_by_id(&self, id: ProjectId) -> Result<Option<Project>, StorageError> {
+        let row: Option<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, adapter_id, root_path, name, created_at, champion_config_id
+             FROM projects WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.storage.pool())
+        .await?;
+        row.map(row_to_project).transpose()
+    }
+
+    /// Fetch by root path.
+    pub async fn get_by_root_path(&self, root: &str) -> Result<Option<Project>, StorageError> {
+        let row: Option<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, adapter_id, root_path, name, created_at, champion_config_id
+             FROM projects WHERE root_path = ?",
+        )
+        .bind(root)
+        .fetch_optional(self.storage.pool())
+        .await?;
+        row.map(row_to_project).transpose()
+    }
+
+    /// List all projects, most recently created first.
+    pub async fn list(&self) -> Result<Vec<Project>, StorageError> {
+        let rows: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, adapter_id, root_path, name, created_at, champion_config_id
+             FROM projects ORDER BY created_at DESC",
+        )
+        .fetch_all(self.storage.pool())
+        .await?;
+        rows.into_iter().map(row_to_project).collect()
+    }
+
+    /// Delete a project and cascade (configs, experiments, sessions, signals go too).
+    pub async fn delete(&self, id: ProjectId) -> Result<(), StorageError> {
+        sqlx::query("DELETE FROM projects WHERE id = ?")
+            .bind(id.to_string())
+            .execute(self.storage.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Update the champion config pointer (used when a challenger is promoted).
+    pub async fn set_champion(
+        &self,
+        id: ProjectId,
+        config_id: ConfigId,
+    ) -> Result<(), StorageError> {
+        sqlx::query("UPDATE projects SET champion_config_id = ? WHERE id = ?")
+            .bind(config_id.to_string())
+            .bind(id.to_string())
+            .execute(self.storage.pool())
+            .await?;
+        Ok(())
+    }
+}
+
+fn row_to_project(
+    (id, adapter_id, root_path, name, created_at, champion): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ),
+) -> Result<Project, StorageError> {
+    Ok(Project {
+        id: ProjectId::from_uuid(Uuid::parse_str(&id)?),
+        adapter_id: AdapterId::new(adapter_id),
+        root_path,
+        name,
+        created_at: DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|e| StorageError::Sqlx(sqlx::Error::Decode(Box::new(e))))?
+            .with_timezone(&Utc),
+        champion_config_id: champion
+            .map(|s| Uuid::parse_str(&s).map(ConfigId::from_uuid))
+            .transpose()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(adapter: &str, root: &str) -> Project {
+        Project {
+            id: ProjectId::new(),
+            adapter_id: AdapterId::new(adapter),
+            root_path: root.to_string(),
+            name: root.rsplit('/').next().unwrap_or(root).to_string(),
+            created_at: Utc::now(),
+            champion_config_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_then_get_by_id_roundtrips() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let repo = ProjectRepo::new(&storage);
+        let p = sample("claude-code", "/tmp/proj-a");
+        repo.insert(&p).await.unwrap();
+        let back = repo.get_by_id(p.id).await.unwrap().unwrap();
+        assert_eq!(back.id, p.id);
+        assert_eq!(back.adapter_id.as_str(), "claude-code");
+        assert_eq!(back.root_path, "/tmp/proj-a");
+    }
+
+    #[tokio::test]
+    async fn get_by_id_returns_none_when_absent() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let repo = ProjectRepo::new(&storage);
+        assert!(repo.get_by_id(ProjectId::new()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_by_root_path_finds_inserted_project() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let repo = ProjectRepo::new(&storage);
+        let p = sample("cursor", "/tmp/proj-b");
+        repo.insert(&p).await.unwrap();
+        let back = repo
+            .get_by_root_path("/tmp/proj-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.id, p.id);
+    }
+
+    #[tokio::test]
+    async fn list_orders_by_created_at_desc() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let repo = ProjectRepo::new(&storage);
+        let older = Project {
+            created_at: Utc::now() - chrono::Duration::hours(1),
+            ..sample("aider", "/tmp/older")
+        };
+        let newer = sample("aider", "/tmp/newer");
+        repo.insert(&older).await.unwrap();
+        repo.insert(&newer).await.unwrap();
+        let rows = repo.list().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, newer.id);
+        assert_eq!(rows[1].id, older.id);
+    }
+
+    #[tokio::test]
+    async fn root_path_uniqueness_is_enforced() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let repo = ProjectRepo::new(&storage);
+        let a = sample("claude-code", "/tmp/dup");
+        let b = sample("cursor", "/tmp/dup");
+        repo.insert(&a).await.unwrap();
+        let err = repo.insert(&b).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Sqlx(sqlx::Error::Database(_))),
+            "expected UNIQUE violation; got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_row() {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let repo = ProjectRepo::new(&storage);
+        let p = sample("claude-code", "/tmp/del");
+        repo.insert(&p).await.unwrap();
+        repo.delete(p.id).await.unwrap();
+        assert!(repo.get_by_id(p.id).await.unwrap().is_none());
+    }
+}
+```
+
+**Step 2: Register the module**
+
+Edit `src/lib.rs`, add `pub mod projects;` under the existing `pub mod pool;` line.
+
+**Step 3: Run tests — expected pass**
+
+Run: `cargo test -p evolve-storage`
+Expected: all `projects::tests` tests pass plus the 3 from Task 2.3.
+
+**Step 4: Lint gates**
+
+Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: clean.
+
+**Step 5: Commit**
+
+```bash
+git add crates/evolve-storage/src/lib.rs crates/evolve-storage/src/projects.rs
+git commit -m "feat(storage): ProjectRepo with insert/get/list/delete/set_champion"
+```
+
+## Task 2.5 — `AgentConfigRepo`
+
+**Files:**
+- Create: `crates/evolve-storage/src/agent_configs.rs`
+- Modify: `crates/evolve-storage/src/lib.rs` (add `pub mod agent_configs;`)
+
+**Step 1: Define the row + the three enum discriminants**
+
+```rust
+//! Repository for the `agent_configs` table.
+
+use crate::error::StorageError;
+use crate::pool::Storage;
+use chrono::{DateTime, Utc};
+use evolve_core::agent_config::AgentConfig;
+use evolve_core::ids::{AdapterId, ConfigId, ProjectId};
+use uuid::Uuid;
+
+/// The role an AgentConfig plays for its project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRole {
+    /// Currently-deployed default.
+    Champion,
+    /// Variant being A/B-tested against the champion.
+    Challenger,
+    /// Retired — kept for the promotion log.
+    Historical,
+}
+
+impl ConfigRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Champion => "champion",
+            Self::Challenger => "challenger",
+            Self::Historical => "historical",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, StorageError> {
+        Ok(match s {
+            "champion" => Self::Champion,
+            "challenger" => Self::Challenger,
+            "historical" => Self::Historical,
+            other => {
+                return Err(StorageError::Sqlx(sqlx::Error::Decode(
+                    format!("unknown config role {other:?}").into(),
+                )))
+            }
+        })
+    }
+}
+
+/// A stored AgentConfig row.
+#[derive(Debug, Clone)]
+pub struct AgentConfigRow {
+    /// Row id.
+    pub id: ConfigId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Adapter this config targets.
+    pub adapter_id: AdapterId,
+    /// Role at time of insertion (can be promoted/retired later).
+    pub role: ConfigRole,
+    /// Stable hash of the payload (from [`AgentConfig::fingerprint`]).
+    pub fingerprint: u64,
+    /// The config itself.
+    pub payload: AgentConfig,
+    /// When this row was inserted.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Repository for `agent_configs`.
+#[derive(Debug, Clone)]
+pub struct AgentConfigRepo<'a> {
+    storage: &'a Storage,
+}
+```
+
+**Step 2: Write failing tests**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::projects::{Project, ProjectRepo};
+
+    async fn seeded_storage() -> (Storage, ProjectId) {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let project = Project {
+            id: ProjectId::new(),
+            adapter_id: AdapterId::new("claude-code"),
+            root_path: "/tmp/agent-config-repo-test".into(),
+            name: "test".into(),
+            created_at: Utc::now(),
+            champion_config_id: None,
+        };
+        ProjectRepo::new(&storage).insert(&project).await.unwrap();
+        let pid = project.id;
+        (storage, pid)
+    }
+
+    fn sample_row(project_id: ProjectId, role: ConfigRole) -> AgentConfigRow {
+        let payload = AgentConfig::default_for("claude-code");
+        AgentConfigRow {
+            id: ConfigId::new(),
+            project_id,
+            adapter_id: AdapterId::new("claude-code"),
+            role,
+            fingerprint: payload.fingerprint(),
+            payload,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_by_id_roundtrips_full_payload() {
+        let (storage, pid) = seeded_storage().await;
+        let repo = AgentConfigRepo::new(&storage);
+        let row = sample_row(pid, ConfigRole::Champion);
+        repo.insert(&row).await.unwrap();
+        let back = repo.get_by_id(row.id).await.unwrap().unwrap();
+        assert_eq!(back.id, row.id);
+        assert_eq!(back.role, ConfigRole::Champion);
+        assert_eq!(back.fingerprint, row.fingerprint);
+        assert_eq!(back.payload, row.payload);
+    }
+
+    #[tokio::test]
+    async fn latest_for_project_role_returns_most_recent() {
+        let (storage, pid) = seeded_storage().await;
+        let repo = AgentConfigRepo::new(&storage);
+
+        let older = AgentConfigRow {
+            created_at: Utc::now() - chrono::Duration::hours(2),
+            ..sample_row(pid, ConfigRole::Champion)
+        };
+        let newer = sample_row(pid, ConfigRole::Champion);
+        repo.insert(&older).await.unwrap();
+        repo.insert(&newer).await.unwrap();
+
+        let latest = repo
+            .latest_for_project_role(pid, ConfigRole::Champion)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.id, newer.id);
+    }
+
+    #[tokio::test]
+    async fn latest_for_project_role_returns_none_when_no_rows() {
+        let (storage, pid) = seeded_storage().await;
+        let repo = AgentConfigRepo::new(&storage);
+        assert!(repo
+            .latest_for_project_role(pid, ConfigRole::Challenger)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cascade_delete_removes_configs() {
+        let (storage, pid) = seeded_storage().await;
+        let repo = AgentConfigRepo::new(&storage);
+        let row = sample_row(pid, ConfigRole::Champion);
+        repo.insert(&row).await.unwrap();
+
+        ProjectRepo::new(&storage).delete(pid).await.unwrap();
+        assert!(repo.get_by_id(row.id).await.unwrap().is_none());
+    }
+}
+```
+
+**Step 3: Run tests — expected fail**
+
+Run: `cargo test -p evolve-storage agent_configs`
+Expected: compile errors (methods missing).
+
+**Step 4: Implement the repo**
+
+```rust
+impl<'a> AgentConfigRepo<'a> {
+    /// Construct a new repo borrowing the storage handle.
+    pub fn new(storage: &'a Storage) -> Self {
+        Self { storage }
+    }
+
+    /// Insert a new config row. Caller owns the id.
+    pub async fn insert(&self, row: &AgentConfigRow) -> Result<(), StorageError> {
+        let payload_json = serde_json::to_string(&row.payload)?;
+        sqlx::query(
+            "INSERT INTO agent_configs
+                (id, project_id, adapter_id, role, fingerprint, payload_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(row.id.to_string())
+        .bind(row.project_id.to_string())
+        .bind(row.adapter_id.as_str())
+        .bind(row.role.as_str())
+        .bind(row.fingerprint as i64) // bit-cast u64 -> i64; see Phase 2 design decisions
+        .bind(payload_json)
+        .bind(row.created_at.to_rfc3339())
+        .execute(self.storage.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch by id.
+    pub async fn get_by_id(&self, id: ConfigId) -> Result<Option<AgentConfigRow>, StorageError> {
+        let row: Option<(String, String, String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT id, project_id, adapter_id, role, fingerprint, payload_json, created_at
+             FROM agent_configs WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.storage.pool())
+        .await?;
+        row.map(row_to_agent_config).transpose()
+    }
+
+    /// Return the most recently created row for `(project, role)`.
+    pub async fn latest_for_project_role(
+        &self,
+        project_id: ProjectId,
+        role: ConfigRole,
+    ) -> Result<Option<AgentConfigRow>, StorageError> {
+        let row: Option<(String, String, String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT id, project_id, adapter_id, role, fingerprint, payload_json, created_at
+             FROM agent_configs
+             WHERE project_id = ? AND role = ?
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(project_id.to_string())
+        .bind(role.as_str())
+        .fetch_optional(self.storage.pool())
+        .await?;
+        row.map(row_to_agent_config).transpose()
+    }
+}
+
+fn row_to_agent_config(
+    (id, project_id, adapter_id, role, fingerprint, payload_json, created_at): (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+    ),
+) -> Result<AgentConfigRow, StorageError> {
+    Ok(AgentConfigRow {
+        id: ConfigId::from_uuid(Uuid::parse_str(&id)?),
+        project_id: ProjectId::from_uuid(Uuid::parse_str(&project_id)?),
+        adapter_id: AdapterId::new(adapter_id),
+        role: ConfigRole::from_str(&role)?,
+        fingerprint: fingerprint as u64,
+        payload: serde_json::from_str(&payload_json)?,
+        created_at: DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|e| StorageError::Sqlx(sqlx::Error::Decode(Box::new(e))))?
+            .with_timezone(&Utc),
+    })
+}
+```
+
+**Step 5: Register module, run tests, lint, commit**
+
+Add `pub mod agent_configs;` to `lib.rs`. Run `cargo test -p evolve-storage`. Expect all passing.
+Run fmt/clippy. Commit:
+
+```bash
+git add crates/evolve-storage/src/lib.rs crates/evolve-storage/src/agent_configs.rs
+git commit -m "feat(storage): AgentConfigRepo with role enum and latest-per-role lookup"
+```
+
+## Task 2.6 — `ExperimentRepo`
+
+**Files:**
+- Create: `crates/evolve-storage/src/experiments.rs`
+- Modify: `crates/evolve-storage/src/lib.rs`
+
+**Step 1: Write failing tests including the partial-unique-index invariant**
+
+```rust
+//! Repository for the `experiments` table.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_configs::{AgentConfigRepo, AgentConfigRow, ConfigRole};
+    use crate::projects::{Project, ProjectRepo};
+    use chrono::Utc;
+    use evolve_core::agent_config::AgentConfig;
+    use evolve_core::ids::{AdapterId, ConfigId, ProjectId};
+
+    async fn seeded() -> (Storage, ProjectId, ConfigId, ConfigId) {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let pid = ProjectId::new();
+        ProjectRepo::new(&storage)
+            .insert(&Project {
+                id: pid,
+                adapter_id: AdapterId::new("claude-code"),
+                root_path: "/tmp/experiments-test".into(),
+                name: "x".into(),
+                created_at: Utc::now(),
+                champion_config_id: None,
+            })
+            .await
+            .unwrap();
+
+        let champion = AgentConfigRow {
+            id: ConfigId::new(),
+            project_id: pid,
+            adapter_id: AdapterId::new("claude-code"),
+            role: ConfigRole::Champion,
+            fingerprint: 1,
+            payload: AgentConfig::default_for("claude-code"),
+            created_at: Utc::now(),
+        };
+        let challenger = AgentConfigRow {
+            id: ConfigId::new(),
+            role: ConfigRole::Challenger,
+            fingerprint: 2,
+            ..champion.clone()
+        };
+        let cfg = AgentConfigRepo::new(&storage);
+        cfg.insert(&champion).await.unwrap();
+        cfg.insert(&challenger).await.unwrap();
+
+        (storage, pid, champion.id, challenger.id)
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_running_returns_the_row() {
+        let (storage, pid, champ, chall) = seeded().await;
+        let repo = ExperimentRepo::new(&storage);
+        let exp = Experiment {
+            id: ExperimentId::new(),
+            project_id: pid,
+            champion_config_id: champ,
+            challenger_config_id: chall,
+            status: ExperimentStatus::Running,
+            traffic_share: 0.05,
+            started_at: Utc::now(),
+            decided_at: None,
+            decision_posterior: None,
+        };
+        repo.insert(&exp).await.unwrap();
+        let back = repo.get_running_for_project(pid).await.unwrap().unwrap();
+        assert_eq!(back.id, exp.id);
+    }
+
+    #[tokio::test]
+    async fn only_one_running_experiment_per_project_is_allowed() {
+        let (storage, pid, champ, chall) = seeded().await;
+        let repo = ExperimentRepo::new(&storage);
+
+        let first = Experiment {
+            id: ExperimentId::new(),
+            project_id: pid,
+            champion_config_id: champ,
+            challenger_config_id: chall,
+            status: ExperimentStatus::Running,
+            traffic_share: 0.05,
+            started_at: Utc::now(),
+            decided_at: None,
+            decision_posterior: None,
+        };
+        let second = Experiment { id: ExperimentId::new(), ..first.clone() };
+        repo.insert(&first).await.unwrap();
+        let err = repo.insert(&second).await.unwrap_err();
+        assert!(matches!(err, StorageError::Sqlx(sqlx::Error::Database(_))));
+    }
+
+    #[tokio::test]
+    async fn update_status_to_promoted_sets_decided_at_and_posterior() {
+        let (storage, pid, champ, chall) = seeded().await;
+        let repo = ExperimentRepo::new(&storage);
+        let exp = Experiment {
+            id: ExperimentId::new(),
+            project_id: pid,
+            champion_config_id: champ,
+            challenger_config_id: chall,
+            status: ExperimentStatus::Running,
+            traffic_share: 0.05,
+            started_at: Utc::now(),
+            decided_at: None,
+            decision_posterior: None,
+        };
+        repo.insert(&exp).await.unwrap();
+        let decided = Utc::now();
+        repo.update_status(exp.id, ExperimentStatus::Promoted, Some(decided), Some(0.97))
+            .await
+            .unwrap();
+
+        let completed = repo.list_completed(pid).await.unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].status, ExperimentStatus::Promoted);
+        assert_eq!(completed[0].decision_posterior, Some(0.97));
+    }
+
+    #[tokio::test]
+    async fn list_completed_excludes_running() {
+        let (storage, pid, champ, chall) = seeded().await;
+        let repo = ExperimentRepo::new(&storage);
+        let exp = Experiment {
+            id: ExperimentId::new(),
+            project_id: pid,
+            champion_config_id: champ,
+            challenger_config_id: chall,
+            status: ExperimentStatus::Running,
+            traffic_share: 0.05,
+            started_at: Utc::now(),
+            decided_at: None,
+            decision_posterior: None,
+        };
+        repo.insert(&exp).await.unwrap();
+        assert!(repo.list_completed(pid).await.unwrap().is_empty());
+    }
+}
+```
+
+**Step 2: Implement `Experiment`, `ExperimentStatus`, `ExperimentRepo`**
+
+```rust
+use crate::error::StorageError;
+use crate::pool::Storage;
+use chrono::{DateTime, Utc};
+use evolve_core::ids::{ConfigId, ExperimentId, ProjectId};
+use uuid::Uuid;
+
+/// Experiment lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperimentStatus {
+    /// Actively collecting signals.
+    Running,
+    /// Challenger won; promoted to champion.
+    Promoted,
+    /// Manually cancelled or superseded.
+    Aborted,
+    /// Decision reached but champion kept.
+    Held,
+}
+
+impl ExperimentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Promoted => "promoted",
+            Self::Aborted => "aborted",
+            Self::Held => "held",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, StorageError> {
+        Ok(match s {
+            "running" => Self::Running,
+            "promoted" => Self::Promoted,
+            "aborted" => Self::Aborted,
+            "held" => Self::Held,
+            other => {
+                return Err(StorageError::Sqlx(sqlx::Error::Decode(
+                    format!("unknown experiment status {other:?}").into(),
+                )))
+            }
+        })
+    }
+}
+
+/// One champion-vs-challenger experiment row.
+#[derive(Debug, Clone)]
+pub struct Experiment {
+    /// Experiment identity.
+    pub id: ExperimentId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Champion config under test.
+    pub champion_config_id: ConfigId,
+    /// Challenger config under test.
+    pub challenger_config_id: ConfigId,
+    /// Lifecycle state.
+    pub status: ExperimentStatus,
+    /// Share of sessions routed to challenger (0..=1).
+    pub traffic_share: f64,
+    /// When the experiment started.
+    pub started_at: DateTime<Utc>,
+    /// When the decision was reached (only set for non-Running statuses).
+    pub decided_at: Option<DateTime<Utc>>,
+    /// P(challenger > champion) at decision time.
+    pub decision_posterior: Option<f64>,
+}
+
+/// Repository for `experiments`.
+#[derive(Debug, Clone)]
+pub struct ExperimentRepo<'a> {
+    storage: &'a Storage,
+}
+
+impl<'a> ExperimentRepo<'a> {
+    /// Construct a new repo borrowing the storage handle.
+    pub fn new(storage: &'a Storage) -> Self {
+        Self { storage }
+    }
+
+    /// Insert a new experiment.
+    pub async fn insert(&self, exp: &Experiment) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO experiments
+                (id, project_id, champion_config_id, challenger_config_id,
+                 status, traffic_share, started_at, decided_at, decision_posterior)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(exp.id.to_string())
+        .bind(exp.project_id.to_string())
+        .bind(exp.champion_config_id.to_string())
+        .bind(exp.challenger_config_id.to_string())
+        .bind(exp.status.as_str())
+        .bind(exp.traffic_share)
+        .bind(exp.started_at.to_rfc3339())
+        .bind(exp.decided_at.map(|d| d.to_rfc3339()))
+        .bind(exp.decision_posterior)
+        .execute(self.storage.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Return the single running experiment for a project, if any.
+    pub async fn get_running_for_project(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<Experiment>, StorageError> {
+        let row: Option<(String, String, String, String, String, f64, String, Option<String>, Option<f64>)> =
+            sqlx::query_as(
+                "SELECT id, project_id, champion_config_id, challenger_config_id,
+                        status, traffic_share, started_at, decided_at, decision_posterior
+                 FROM experiments
+                 WHERE project_id = ? AND status = 'running'
+                 LIMIT 1",
+            )
+            .bind(project_id.to_string())
+            .fetch_optional(self.storage.pool())
+            .await?;
+        row.map(row_to_experiment).transpose()
+    }
+
+    /// List all non-Running experiments for a project, most recent first.
+    pub async fn list_completed(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<Experiment>, StorageError> {
+        let rows: Vec<(String, String, String, String, String, f64, String, Option<String>, Option<f64>)> =
+            sqlx::query_as(
+                "SELECT id, project_id, champion_config_id, challenger_config_id,
+                        status, traffic_share, started_at, decided_at, decision_posterior
+                 FROM experiments
+                 WHERE project_id = ? AND status != 'running'
+                 ORDER BY decided_at DESC NULLS LAST, started_at DESC",
+            )
+            .bind(project_id.to_string())
+            .fetch_all(self.storage.pool())
+            .await?;
+        rows.into_iter().map(row_to_experiment).collect()
+    }
+
+    /// Update the lifecycle state (and decision timestamp + posterior on terminal transitions).
+    pub async fn update_status(
+        &self,
+        id: ExperimentId,
+        status: ExperimentStatus,
+        decided_at: Option<DateTime<Utc>>,
+        decision_posterior: Option<f64>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE experiments
+             SET status = ?, decided_at = ?, decision_posterior = ?
+             WHERE id = ?",
+        )
+        .bind(status.as_str())
+        .bind(decided_at.map(|d| d.to_rfc3339()))
+        .bind(decision_posterior)
+        .bind(id.to_string())
+        .execute(self.storage.pool())
+        .await?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn row_to_experiment(
+    (id, project_id, champion, challenger, status, traffic_share, started_at, decided_at, posterior): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        f64,
+        String,
+        Option<String>,
+        Option<f64>,
+    ),
+) -> Result<Experiment, StorageError> {
+    Ok(Experiment {
+        id: ExperimentId::from_uuid(Uuid::parse_str(&id)?),
+        project_id: ProjectId::from_uuid(Uuid::parse_str(&project_id)?),
+        champion_config_id: ConfigId::from_uuid(Uuid::parse_str(&champion)?),
+        challenger_config_id: ConfigId::from_uuid(Uuid::parse_str(&challenger)?),
+        status: ExperimentStatus::from_str(&status)?,
+        traffic_share,
+        started_at: DateTime::parse_from_rfc3339(&started_at)
+            .map_err(|e| StorageError::Sqlx(sqlx::Error::Decode(Box::new(e))))?
+            .with_timezone(&Utc),
+        decided_at: decided_at
+            .map(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(|e| StorageError::Sqlx(sqlx::Error::Decode(Box::new(e))))
+            })
+            .transpose()?,
+        decision_posterior: posterior,
+    })
+}
+```
+
+**Note on `NULLS LAST`:** SQLite sorts `NULL` before non-null by default under `DESC`, which is the behavior we want here (rows without `decided_at` yet rank last under DESC). If your SQLite version rejects `NULLS LAST`, drop the clause — default behavior is acceptable.
+
+**Step 3: Register, run tests, lint, commit**
+
+```bash
+git add crates/evolve-storage/src/lib.rs crates/evolve-storage/src/experiments.rs
+git commit -m "feat(storage): ExperimentRepo with partial-unique 'one running per project' enforcement"
+```
+
+## Task 2.7 — `SessionRepo`
+
+**Files:**
+- Create: `crates/evolve-storage/src/sessions.rs`
+- Modify: `crates/evolve-storage/src/lib.rs`
+
+**Step 1: Write failing tests covering ordering + experiment filtering**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_configs::{AgentConfigRepo, AgentConfigRow, ConfigRole};
+    use crate::experiments::{Experiment, ExperimentRepo, ExperimentStatus};
+    use crate::projects::{Project, ProjectRepo};
+    use chrono::Utc;
+    use evolve_core::agent_config::AgentConfig;
+    use evolve_core::ids::{AdapterId, ConfigId, ExperimentId, ProjectId};
+
+    async fn seeded() -> (Storage, ProjectId, ConfigId, ConfigId, ExperimentId) {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let pid = ProjectId::new();
+        ProjectRepo::new(&storage)
+            .insert(&Project {
+                id: pid,
+                adapter_id: AdapterId::new("claude-code"),
+                root_path: "/tmp/sessions-test".into(),
+                name: "s".into(),
+                created_at: Utc::now(),
+                champion_config_id: None,
+            })
+            .await
+            .unwrap();
+
+        let champ = AgentConfigRow {
+            id: ConfigId::new(),
+            project_id: pid,
+            adapter_id: AdapterId::new("claude-code"),
+            role: ConfigRole::Champion,
+            fingerprint: 1,
+            payload: AgentConfig::default_for("claude-code"),
+            created_at: Utc::now(),
+        };
+        let chall = AgentConfigRow {
+            id: ConfigId::new(),
+            role: ConfigRole::Challenger,
+            ..champ.clone()
+        };
+        let cfg = AgentConfigRepo::new(&storage);
+        cfg.insert(&champ).await.unwrap();
+        cfg.insert(&chall).await.unwrap();
+
+        let eid = ExperimentId::new();
+        ExperimentRepo::new(&storage)
+            .insert(&Experiment {
+                id: eid,
+                project_id: pid,
+                champion_config_id: champ.id,
+                challenger_config_id: chall.id,
+                status: ExperimentStatus::Running,
+                traffic_share: 0.1,
+                started_at: Utc::now(),
+                decided_at: None,
+                decision_posterior: None,
+            })
+            .await
+            .unwrap();
+
+        (storage, pid, champ.id, chall.id, eid)
+    }
+
+    #[tokio::test]
+    async fn list_recent_orders_newest_first_and_respects_limit() {
+        let (storage, pid, champ, _chall, _eid) = seeded().await;
+        let repo = SessionRepo::new(&storage);
+
+        for i in 0..5 {
+            let s = Session {
+                id: SessionId::new(),
+                project_id: pid,
+                experiment_id: None,
+                variant: SessionVariant::Champion,
+                config_id: champ,
+                started_at: Utc::now() - chrono::Duration::minutes(i * 10),
+                ended_at: Utc::now() - chrono::Duration::minutes(i * 10) + chrono::Duration::minutes(5),
+                adapter_session_ref: Some(format!("transcript-{i}.jsonl")),
+            };
+            repo.insert(&s).await.unwrap();
+        }
+        let rows = repo.list_recent(pid, 3).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].started_at >= rows[1].started_at);
+        assert!(rows[1].started_at >= rows[2].started_at);
+    }
+
+    #[tokio::test]
+    async fn list_for_experiment_returns_only_tagged_sessions() {
+        let (storage, pid, champ, chall, eid) = seeded().await;
+        let repo = SessionRepo::new(&storage);
+
+        let tagged = Session {
+            id: SessionId::new(),
+            project_id: pid,
+            experiment_id: Some(eid),
+            variant: SessionVariant::Challenger,
+            config_id: chall,
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            adapter_session_ref: None,
+        };
+        let untagged = Session {
+            id: SessionId::new(),
+            project_id: pid,
+            experiment_id: None,
+            variant: SessionVariant::Champion,
+            config_id: champ,
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            adapter_session_ref: None,
+        };
+        repo.insert(&tagged).await.unwrap();
+        repo.insert(&untagged).await.unwrap();
+
+        let got = repo.list_for_experiment(eid).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, tagged.id);
+    }
+}
+```
+
+**Step 2: Implement `Session`, `SessionVariant`, `SessionRepo`**
+
+```rust
+use crate::error::StorageError;
+use crate::pool::Storage;
+use chrono::{DateTime, Utc};
+use evolve_core::ids::{ConfigId, ExperimentId, ProjectId, SessionId};
+use uuid::Uuid;
+
+/// Which variant was active when this session ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionVariant {
+    /// The project's champion config was applied.
+    Champion,
+    /// The active experiment's challenger config was applied.
+    Challenger,
+}
+
+impl SessionVariant {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Champion => "champion",
+            Self::Challenger => "challenger",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, StorageError> {
+        Ok(match s {
+            "champion" => Self::Champion,
+            "challenger" => Self::Challenger,
+            other => {
+                return Err(StorageError::Sqlx(sqlx::Error::Decode(
+                    format!("unknown session variant {other:?}").into(),
+                )))
+            }
+        })
+    }
+}
+
+/// One recorded user session.
+#[derive(Debug, Clone)]
+pub struct Session {
+    /// Session identity.
+    pub id: SessionId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Experiment active when the session started, if any.
+    pub experiment_id: Option<ExperimentId>,
+    /// Which variant was deployed for this session.
+    pub variant: SessionVariant,
+    /// The exact config row that was active.
+    pub config_id: ConfigId,
+    /// Start time.
+    pub started_at: DateTime<Utc>,
+    /// End time.
+    pub ended_at: DateTime<Utc>,
+    /// Opaque adapter-specific reference (e.g., transcript filename).
+    pub adapter_session_ref: Option<String>,
+}
+
+/// Repository for `sessions`.
+#[derive(Debug, Clone)]
+pub struct SessionRepo<'a> {
+    storage: &'a Storage,
+}
+
+impl<'a> SessionRepo<'a> {
+    /// Construct a new repo borrowing the storage handle.
+    pub fn new(storage: &'a Storage) -> Self {
+        Self { storage }
+    }
+
+    /// Insert a new session row.
+    pub async fn insert(&self, s: &Session) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO sessions
+                (id, project_id, experiment_id, variant, config_id,
+                 started_at, ended_at, adapter_session_ref)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(s.id.to_string())
+        .bind(s.project_id.to_string())
+        .bind(s.experiment_id.map(|e| e.to_string()))
+        .bind(s.variant.as_str())
+        .bind(s.config_id.to_string())
+        .bind(s.started_at.to_rfc3339())
+        .bind(s.ended_at.to_rfc3339())
+        .bind(s.adapter_session_ref.as_deref())
+        .execute(self.storage.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// List most recent sessions for a project (descending by `started_at`).
+    pub async fn list_recent(
+        &self,
+        project_id: ProjectId,
+        limit: u32,
+    ) -> Result<Vec<Session>, StorageError> {
+        let rows: Vec<(String, String, Option<String>, String, String, String, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, project_id, experiment_id, variant, config_id,
+                        started_at, ended_at, adapter_session_ref
+                 FROM sessions
+                 WHERE project_id = ?
+                 ORDER BY started_at DESC
+                 LIMIT ?",
+            )
+            .bind(project_id.to_string())
+            .bind(limit as i64)
+            .fetch_all(self.storage.pool())
+            .await?;
+        rows.into_iter().map(row_to_session).collect()
+    }
+
+    /// All sessions belonging to a specific experiment.
+    pub async fn list_for_experiment(
+        &self,
+        experiment_id: ExperimentId,
+    ) -> Result<Vec<Session>, StorageError> {
+        let rows: Vec<(String, String, Option<String>, String, String, String, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, project_id, experiment_id, variant, config_id,
+                        started_at, ended_at, adapter_session_ref
+                 FROM sessions
+                 WHERE experiment_id = ?
+                 ORDER BY started_at DESC",
+            )
+            .bind(experiment_id.to_string())
+            .fetch_all(self.storage.pool())
+            .await?;
+        rows.into_iter().map(row_to_session).collect()
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn row_to_session(
+    (id, project_id, experiment_id, variant, config_id, started_at, ended_at, ref_): (
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ),
+) -> Result<Session, StorageError> {
+    let parse_ts = |s: &str| {
+        DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| StorageError::Sqlx(sqlx::Error::Decode(Box::new(e))))
+    };
+    Ok(Session {
+        id: SessionId::from_uuid(Uuid::parse_str(&id)?),
+        project_id: ProjectId::from_uuid(Uuid::parse_str(&project_id)?),
+        experiment_id: experiment_id
+            .map(|s| Uuid::parse_str(&s).map(ExperimentId::from_uuid))
+            .transpose()?,
+        variant: SessionVariant::from_str(&variant)?,
+        config_id: ConfigId::from_uuid(Uuid::parse_str(&config_id)?),
+        started_at: parse_ts(&started_at)?,
+        ended_at: parse_ts(&ended_at)?,
+        adapter_session_ref: ref_,
+    })
+}
+```
+
+**Step 3: Register, run, lint, commit**
+
+```bash
+git commit -m "feat(storage): SessionRepo with recent-for-project and per-experiment lookups"
+```
+
+## Task 2.8 — `SignalRepo`
+
+**Files:**
+- Create: `crates/evolve-storage/src/signals.rs`
+- Modify: `crates/evolve-storage/src/lib.rs`
+
+**Step 1: Write failing tests (functional + privacy invariant)**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_configs::{AgentConfigRepo, AgentConfigRow, ConfigRole};
+    use crate::projects::{Project, ProjectRepo};
+    use crate::sessions::{Session, SessionRepo, SessionVariant};
+    use chrono::Utc;
+    use evolve_core::agent_config::AgentConfig;
+    use evolve_core::ids::{AdapterId, ConfigId, ProjectId, SessionId};
+
+    async fn seeded() -> (Storage, SessionId, ConfigId) {
+        let storage = Storage::in_memory_for_tests().await.unwrap();
+        let pid = ProjectId::new();
+        ProjectRepo::new(&storage)
+            .insert(&Project {
+                id: pid,
+                adapter_id: AdapterId::new("claude-code"),
+                root_path: "/tmp/signals-test".into(),
+                name: "g".into(),
+                created_at: Utc::now(),
+                champion_config_id: None,
+            })
+            .await
+            .unwrap();
+
+        let cfg = AgentConfigRow {
+            id: ConfigId::new(),
+            project_id: pid,
+            adapter_id: AdapterId::new("claude-code"),
+            role: ConfigRole::Champion,
+            fingerprint: 1,
+            payload: AgentConfig::default_for("claude-code"),
+            created_at: Utc::now(),
+        };
+        AgentConfigRepo::new(&storage).insert(&cfg).await.unwrap();
+
+        let sid = SessionId::new();
+        SessionRepo::new(&storage)
+            .insert(&Session {
+                id: sid,
+                project_id: pid,
+                experiment_id: None,
+                variant: SessionVariant::Champion,
+                config_id: cfg.id,
+                started_at: Utc::now(),
+                ended_at: Utc::now(),
+                adapter_session_ref: None,
+            })
+            .await
+            .unwrap();
+        (storage, sid, cfg.id)
+    }
+
+    #[tokio::test]
+    async fn insert_then_list_for_session_roundtrips() {
+        let (storage, sid, _cfg) = seeded().await;
+        let repo = SignalRepo::new(&storage);
+        let sig = Signal {
+            id: SignalId::new(),
+            session_id: sid,
+            kind: SignalKind::Implicit,
+            source: "tests_passed".into(),
+            value: 1.0,
+            recorded_at: Utc::now(),
+            payload_json: Some("{\"exit_code\":0}".into()),
+        };
+        repo.insert(&sig).await.unwrap();
+        let got = repo.list_for_session(sid).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].source, "tests_passed");
+        assert_eq!(got[0].value, 1.0);
+    }
+
+    #[tokio::test]
+    async fn list_for_config_joins_via_sessions() {
+        let (storage, sid, cfg) = seeded().await;
+        let repo = SignalRepo::new(&storage);
+        for (src, val) in [("a", 1.0), ("b", 0.0)] {
+            repo.insert(&Signal {
+                id: SignalId::new(),
+                session_id: sid,
+                kind: SignalKind::Explicit,
+                source: src.into(),
+                value: val,
+                recorded_at: Utc::now(),
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        }
+        let got = repo.list_for_config(cfg).await.unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn payload_json_never_contains_code_like_content() {
+        // Privacy invariant: payload_json must never carry source code.
+        // This test validates the invariant by attempting to insert known bad content
+        // and asserting insertion is rejected at the application layer.
+        let (storage, sid, _cfg) = seeded().await;
+        let repo = SignalRepo::new(&storage);
+        let err = repo
+            .insert(&Signal {
+                id: SignalId::new(),
+                session_id: sid,
+                kind: SignalKind::Implicit,
+                source: "suspicious".into(),
+                value: 0.5,
+                recorded_at: Utc::now(),
+                payload_json: Some("fn main() { let x = 1; }".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PayloadRejected(_)));
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_value_outside_unit_interval() {
+        let (storage, sid, _cfg) = seeded().await;
+        let repo = SignalRepo::new(&storage);
+        let err = repo
+            .insert(&Signal {
+                id: SignalId::new(),
+                session_id: sid,
+                kind: SignalKind::Implicit,
+                source: "bad_value".into(),
+                value: 1.5,
+                recorded_at: Utc::now(),
+                payload_json: None,
+            })
+            .await
+            .unwrap_err();
+        // DB-level CHECK will fire.
+        assert!(matches!(err, StorageError::Sqlx(sqlx::Error::Database(_))));
+    }
+}
+```
+
+**Step 2: Add `PayloadRejected` variant to `StorageError`**
+
+In `src/error.rs`, add:
+
+```rust
+    /// Privacy-invariant check tripped: payload looked code-like.
+    #[error("payload rejected: {0}")]
+    PayloadRejected(&'static str),
+```
+
+**Step 3: Implement `Signal`, `SignalKind`, `SignalRepo`**
+
+```rust
+use crate::error::StorageError;
+use crate::pool::Storage;
+use chrono::{DateTime, Utc};
+use evolve_core::ids::{ConfigId, SessionId, SignalId};
+use uuid::Uuid;
+
+/// Source-of-truth for signal categorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalKind {
+    /// User explicitly graded the session (`evolve good/bad/thumbs`).
+    Explicit,
+    /// Inferred from adapter session log.
+    Implicit,
+}
+
+impl SignalKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Implicit => "implicit",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, StorageError> {
+        Ok(match s {
+            "explicit" => Self::Explicit,
+            "implicit" => Self::Implicit,
+            other => {
+                return Err(StorageError::Sqlx(sqlx::Error::Decode(
+                    format!("unknown signal kind {other:?}").into(),
+                )))
+            }
+        })
+    }
+}
+
+/// One fitness signal contributed to a session.
+#[derive(Debug, Clone)]
+pub struct Signal {
+    /// Signal identity.
+    pub id: SignalId,
+    /// Owning session.
+    pub session_id: SessionId,
+    /// Explicit (user-provided) vs implicit (inferred).
+    pub kind: SignalKind,
+    /// Short tag for the source (e.g., `tests_passed`, `user_clear`).
+    pub source: String,
+    /// Normalized score in `[0.0, 1.0]`.
+    pub value: f64,
+    /// When the signal was recorded.
+    pub recorded_at: DateTime<Utc>,
+    /// Optional opaque JSON metadata. MUST NOT contain source code.
+    pub payload_json: Option<String>,
+}
+
+/// Repository for `signals`.
+#[derive(Debug, Clone)]
+pub struct SignalRepo<'a> {
+    storage: &'a Storage,
+}
+
+impl<'a> SignalRepo<'a> {
+    /// Construct a new repo borrowing the storage handle.
+    pub fn new(storage: &'a Storage) -> Self {
+        Self { storage }
+    }
+
+    /// Insert a new signal. Rejects payloads that look like source code
+    /// (privacy invariant; see design doc Section 7).
+    pub async fn insert(&self, s: &Signal) -> Result<(), StorageError> {
+        if let Some(payload) = s.payload_json.as_deref() {
+            if looks_like_source_code(payload) {
+                return Err(StorageError::PayloadRejected(
+                    "payload contains code-like content",
+                ));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO signals
+                (id, session_id, kind, source, value, recorded_at, payload_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(s.id.to_string())
+        .bind(s.session_id.to_string())
+        .bind(s.kind.as_str())
+        .bind(&s.source)
+        .bind(s.value)
+        .bind(s.recorded_at.to_rfc3339())
+        .bind(s.payload_json.as_deref())
+        .execute(self.storage.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// All signals recorded for a session.
+    pub async fn list_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<Signal>, StorageError> {
+        let rows: Vec<(String, String, String, String, f64, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, session_id, kind, source, value, recorded_at, payload_json
+             FROM signals
+             WHERE session_id = ?
+             ORDER BY recorded_at ASC",
+        )
+        .bind(session_id.to_string())
+        .fetch_all(self.storage.pool())
+        .await?;
+        rows.into_iter().map(row_to_signal).collect()
+    }
+
+    /// All signals recorded for sessions that used a given config.
+    pub async fn list_for_config(&self, config_id: ConfigId) -> Result<Vec<Signal>, StorageError> {
+        let rows: Vec<(String, String, String, String, f64, String, Option<String>)> = sqlx::query_as(
+            "SELECT sig.id, sig.session_id, sig.kind, sig.source, sig.value,
+                    sig.recorded_at, sig.payload_json
+             FROM signals sig
+             JOIN sessions s ON s.id = sig.session_id
+             WHERE s.config_id = ?
+             ORDER BY sig.recorded_at ASC",
+        )
+        .bind(config_id.to_string())
+        .fetch_all(self.storage.pool())
+        .await?;
+        rows.into_iter().map(row_to_signal).collect()
+    }
+}
+
+/// Simple heuristic: reject payloads that contain tokens common in source code.
+/// Intentionally conservative — false positives are preferable to leaking code.
+fn looks_like_source_code(payload: &str) -> bool {
+    const BANNED: &[&str] = &[
+        "fn ", "def ", "class ", "function ", "=>", "import ", "#include",
+        "public class", "console.log", "println!", "SELECT ", "INSERT INTO",
+    ];
+    BANNED.iter().any(|needle| payload.contains(needle))
+}
+
+#[allow(clippy::type_complexity)]
+fn row_to_signal(
+    (id, session_id, kind, source, value, recorded_at, payload): (
+        String,
+        String,
+        String,
+        String,
+        f64,
+        String,
+        Option<String>,
+    ),
+) -> Result<Signal, StorageError> {
+    Ok(Signal {
+        id: SignalId::from_uuid(Uuid::parse_str(&id)?),
+        session_id: SessionId::from_uuid(Uuid::parse_str(&session_id)?),
+        kind: SignalKind::from_str(&kind)?,
+        source,
+        value,
+        recorded_at: DateTime::parse_from_rfc3339(&recorded_at)
+            .map_err(|e| StorageError::Sqlx(sqlx::Error::Decode(Box::new(e))))?
+            .with_timezone(&Utc),
+        payload_json: payload,
+    })
+}
+```
+
+**Step 4: Register module, run tests, lint, commit**
+
+```bash
+git commit -m "feat(storage): SignalRepo with privacy-guard on payload_json"
+```
+
+## Task 2.9 — Survives-restart integration test
+
+**Files:**
+- Create: `crates/evolve-storage/tests/restart.rs`
+
+**Step 1: Write the test**
+
+```rust
+//! End-to-end: open → write → drop → reopen → read the same data.
+
+use chrono::Utc;
+use evolve_core::agent_config::AgentConfig;
+use evolve_core::ids::{AdapterId, ConfigId, ProjectId};
+use evolve_storage::agent_configs::{AgentConfigRepo, AgentConfigRow, ConfigRole};
+use evolve_storage::projects::{Project, ProjectRepo};
+use evolve_storage::Storage;
+use tempfile::TempDir;
+
+#[tokio::test]
+async fn data_survives_process_restart() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("evolve.db");
+
+    let project_id = ProjectId::new();
+    let config_id = ConfigId::new();
+
+    {
+        let storage = Storage::open(&db_path).await.unwrap();
+        ProjectRepo::new(&storage)
+            .insert(&Project {
+                id: project_id,
+                adapter_id: AdapterId::new("claude-code"),
+                root_path: "/tmp/restart-test".into(),
+                name: "restart".into(),
+                created_at: Utc::now(),
+                champion_config_id: None,
+            })
+            .await
+            .unwrap();
+
+        AgentConfigRepo::new(&storage)
+            .insert(&AgentConfigRow {
+                id: config_id,
+                project_id,
+                adapter_id: AdapterId::new("claude-code"),
+                role: ConfigRole::Champion,
+                fingerprint: 42,
+                payload: AgentConfig::default_for("claude-code"),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        // storage goes out of scope → pool closes
+    }
+
+    // Reopen and verify.
+    let storage = Storage::open(&db_path).await.unwrap();
+    let back_project = ProjectRepo::new(&storage)
+        .get_by_id(project_id)
+        .await
+        .unwrap()
+        .expect("project should survive restart");
+    assert_eq!(back_project.id, project_id);
+
+    let back_cfg = AgentConfigRepo::new(&storage)
+        .get_by_id(config_id)
+        .await
+        .unwrap()
+        .expect("config should survive restart");
+    assert_eq!(back_cfg.id, config_id);
+    assert_eq!(back_cfg.fingerprint, 42);
+}
+
+#[tokio::test]
+async fn cascade_delete_project_removes_everything_downstream() {
+    use evolve_storage::sessions::{Session, SessionRepo, SessionVariant};
+    use evolve_storage::signals::{Signal, SignalKind, SignalRepo};
+    use evolve_core::ids::{SessionId, SignalId};
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("evolve.db");
+    let storage = Storage::open(&db_path).await.unwrap();
+
+    let project = Project {
+        id: ProjectId::new(),
+        adapter_id: AdapterId::new("claude-code"),
+        root_path: "/tmp/cascade-test".into(),
+        name: "cascade".into(),
+        created_at: Utc::now(),
+        champion_config_id: None,
+    };
+    ProjectRepo::new(&storage).insert(&project).await.unwrap();
+
+    let cfg = AgentConfigRow {
+        id: ConfigId::new(),
+        project_id: project.id,
+        adapter_id: AdapterId::new("claude-code"),
+        role: ConfigRole::Champion,
+        fingerprint: 1,
+        payload: AgentConfig::default_for("claude-code"),
+        created_at: Utc::now(),
+    };
+    AgentConfigRepo::new(&storage).insert(&cfg).await.unwrap();
+
+    let session = Session {
+        id: SessionId::new(),
+        project_id: project.id,
+        experiment_id: None,
+        variant: SessionVariant::Champion,
+        config_id: cfg.id,
+        started_at: Utc::now(),
+        ended_at: Utc::now(),
+        adapter_session_ref: None,
+    };
+    SessionRepo::new(&storage).insert(&session).await.unwrap();
+
+    let signal = Signal {
+        id: SignalId::new(),
+        session_id: session.id,
+        kind: SignalKind::Implicit,
+        source: "x".into(),
+        value: 0.5,
+        recorded_at: Utc::now(),
+        payload_json: None,
+    };
+    SignalRepo::new(&storage).insert(&signal).await.unwrap();
+
+    // Delete project and re-check.
+    ProjectRepo::new(&storage).delete(project.id).await.unwrap();
+
+    assert!(ProjectRepo::new(&storage).get_by_id(project.id).await.unwrap().is_none());
+    assert!(AgentConfigRepo::new(&storage).get_by_id(cfg.id).await.unwrap().is_none());
+    assert!(SignalRepo::new(&storage).list_for_session(session.id).await.unwrap().is_empty());
+}
+```
+
+**Step 2: Expose repo modules as `pub` in `lib.rs`**
+
+Ensure `src/lib.rs` looks like:
+
+```rust
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod agent_configs;
+pub mod error;
+pub mod experiments;
+pub mod pool;
+pub mod projects;
+pub mod sessions;
+pub mod signals;
+
+pub use error::StorageError;
+pub use pool::Storage;
+```
+
+**Step 3: Run the test**
+
+Run: `cargo test -p evolve-storage --test restart`
+Expected: both tests pass.
+
+**Step 4: Commit**
+
+```bash
+git commit -m "test(storage): end-to-end restart + cascade-delete integration tests"
+```
+
+## Task 2.10 — Phase 2 verification gates
+
+**Step 1: Full workspace test + lint**
+
+Run all in sequence:
+```bash
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+Expected: all clean.
+
+**Step 2: Coverage**
+
+Run: `cargo llvm-cov --package evolve-storage --summary-only`
+Expected: line coverage ≥ 75%.
+
+If below threshold: identify the untested code path, add a focused test, re-run. Do NOT weaken the threshold.
+
+**Step 3: Verify privacy invariant held**
+
+Run: `cargo test -p evolve-storage payload_json_never_contains_code_like_content`
+Expected: PASS (the test itself asserts that inserting a code-like payload yields `StorageError::PayloadRejected`).
+
+**Step 4: No commit (verification-only).**
 
 **PHASE 2 COMPLETE.**
 
