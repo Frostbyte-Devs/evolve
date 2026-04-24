@@ -15,10 +15,13 @@ path = "src/main.rs"
 [dependencies]
 evolve-adapters = { path = "../evolve-adapters" }
 evolve-core = { path = "../evolve-core" }
+evolve-dashboard = { path = "../evolve-dashboard" }
 evolve-llm = { path = "../evolve-llm" }
+evolve-proxy = { path = "../evolve-proxy" }
 evolve-storage = { path = "../evolve-storage" }
 clap.workspace = true
 dirs.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "signal"] }

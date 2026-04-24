@@ -70,6 +70,22 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Start the local dashboard (http://127.0.0.1:<port>).
+    Dashboard {
+        /// TCP port. Default 8787.
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
+    /// Start the OpenAI-compat proxy (http://127.0.0.1:<port>). Requires
+    /// EVOLVE_UPSTREAM_URL and EVOLVE_UPSTREAM_TOKEN in the environment.
+    Proxy {
+        /// Adapter id this proxy serves (informational, for logging).
+        #[arg(long, default_value = "cursor")]
+        adapter: String,
+        /// TCP port. Default 7777.
+        #[arg(long, default_value_t = 7777)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -116,7 +132,56 @@ async fn main() -> Result<()> {
         Command::Forget { project_id, all } => {
             cmd_forget(&storage, &registry, project_id, all).await
         }
+        Command::Dashboard { port } => cmd_dashboard(storage, port).await,
+        Command::Proxy { adapter, port } => cmd_proxy(&storage, &adapter, port).await,
     }
+}
+
+async fn cmd_dashboard(storage: Storage, port: u16) -> Result<()> {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let state = evolve_dashboard::AppState {
+        storage: std::sync::Arc::new(storage),
+    };
+    println!("Dashboard listening on http://{addr}");
+    evolve_dashboard::serve(addr, state).await?;
+    Ok(())
+}
+
+async fn cmd_proxy(storage: &Storage, adapter: &str, port: u16) -> Result<()> {
+    // Pick the active champion's system_prompt_prefix for the first project
+    // matching this adapter. Bare-minimum wiring — a future version can let
+    // the proxy swap prefixes live as new champions are promoted.
+    let project_repo = ProjectRepo::new(storage);
+    let projects = project_repo.list().await?;
+    let project = projects
+        .into_iter()
+        .find(|p| p.adapter_id.as_str() == adapter)
+        .context("no projects registered for this adapter; run `evolve init` first")?;
+    let cfg_id = project
+        .champion_config_id
+        .context("project has no champion config")?;
+    let cfg_row = AgentConfigRepo::new(storage)
+        .get_by_id(cfg_id)
+        .await?
+        .context("champion config row missing")?;
+
+    let upstream = std::env::var("EVOLVE_UPSTREAM_URL")
+        .context("EVOLVE_UPSTREAM_URL must be set (e.g. https://api.openai.com)")?;
+    let upstream_token = std::env::var("EVOLVE_UPSTREAM_TOKEN").ok();
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let state = evolve_proxy::AppState {
+        config: evolve_proxy::ProxyConfig {
+            upstream,
+            upstream_token,
+            prefix: cfg_row.payload.system_prompt_prefix,
+        },
+        signals: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        http: reqwest::Client::new(),
+    };
+    println!("Proxy listening on http://{addr}  (adapter={adapter})");
+    evolve_proxy::serve(addr, state).await?;
+    Ok(())
 }
 
 fn resolve_home(flag: Option<PathBuf>) -> Result<PathBuf> {
