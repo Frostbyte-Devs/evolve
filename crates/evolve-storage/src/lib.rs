@@ -11,6 +11,7 @@ pub mod error;
 pub mod experiments;
 pub mod pool;
 pub mod projects;
+pub mod sessions;
 
 pub use error::StorageError;
 pub use pool::Storage;
