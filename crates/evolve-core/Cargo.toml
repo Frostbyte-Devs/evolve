@@ -19,6 +19,7 @@ rand_chacha.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 dashmap.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
