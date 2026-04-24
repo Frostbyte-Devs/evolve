@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod pool;
+pub mod projects;
 
 pub use error::StorageError;
 pub use pool::Storage;
