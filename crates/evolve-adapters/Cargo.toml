@@ -9,7 +9,7 @@ repository.workspace = true
 description = "Adapter trait + per-tool integrations (Claude Code, Cursor, Aider)"
 
 [dependencies]
-evolve-core = { path = "../evolve-core" }
+evolve-core = { path = "../evolve-core", version = "0.1.0" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
