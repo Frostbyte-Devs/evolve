@@ -113,7 +113,16 @@ jobs:
           set -e
           for crate in evolve-core evolve-storage evolve-llm evolve-mutators evolve-adapters evolve-proxy evolve-dashboard evolve-cli; do
             echo "=== publishing $crate ==="
-            cargo publish -p $crate --no-verify
-            # give crates.io index time to propagate before the next crate resolves this one
-            sleep 20
+            if cargo publish -p $crate --no-verify 2>&1 | tee /tmp/publish.log; then
+              echo "--- $crate: published OK ---"
+            else
+              if grep -q "already exists on crates.io" /tmp/publish.log; then
+                echo "--- $crate: already published, skipping ---"
+              else
+                echo "--- $crate: FAILED ---"
+                exit 1
+              fi
+            fi
+            # space out new-crate publishes; crates.io rate-limits new crates
+            sleep 30
           done
