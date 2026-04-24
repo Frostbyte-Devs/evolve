@@ -8,6 +8,7 @@
 
 pub mod agent_config;
 pub mod ids;
+pub mod promotion;
 pub mod schema;
 
 #[cfg(test)]
