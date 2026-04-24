@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/evolve-core", "crates/evolve-storage"]
+members = ["crates/evolve-core", "crates/evolve-llm", "crates/evolve-storage"]
 exclude = []
 
 [workspace.package]
@@ -34,6 +34,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
 tempfile = "3"
 rand_distr = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+wiremock = "0.6"
 
 [profile.release]
 lto = "thin"
