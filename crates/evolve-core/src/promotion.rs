@@ -52,6 +52,24 @@ impl SignalInput {
     }
 }
 
+/// Collapse a session's signals into a single fitness score in `[0.0, 1.0]`.
+///
+/// Uses the weighted arithmetic mean. Values are clamped to `[0.0, 1.0]`
+/// before weighting. Empty input returns `0.5` (neutral prior).
+pub fn aggregate(signals: &[SignalInput], config: &AggregationConfig) -> f64 {
+    if signals.is_empty() {
+        return 0.5;
+    }
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for s in signals {
+        let w = s.weight(config);
+        numerator += w * s.value.clamp(0.0, 1.0);
+        denominator += w;
+    }
+    (numerator / denominator).clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +93,87 @@ mod tests {
             value: 1.0,
         };
         assert_eq!(e.weight(&cfg) / i.weight(&cfg), 5.0);
+    }
+
+    #[test]
+    fn aggregate_empty_returns_neutral_half() {
+        assert_eq!(aggregate(&[], &AggregationConfig::default()), 0.5);
+    }
+
+    #[test]
+    fn aggregate_single_explicit_1_is_1() {
+        let signals = [SignalInput {
+            kind: SignalKind::Explicit,
+            value: 1.0,
+        }];
+        assert_eq!(aggregate(&signals, &AggregationConfig::default()), 1.0);
+    }
+
+    #[test]
+    fn aggregate_single_implicit_0_is_0() {
+        let signals = [SignalInput {
+            kind: SignalKind::Implicit,
+            value: 0.0,
+        }];
+        assert_eq!(aggregate(&signals, &AggregationConfig::default()), 0.0);
+    }
+
+    #[test]
+    fn aggregate_clips_out_of_range_values() {
+        let signals = [SignalInput {
+            kind: SignalKind::Implicit,
+            value: 2.0,
+        }];
+        assert_eq!(aggregate(&signals, &AggregationConfig::default()), 1.0);
+    }
+
+    #[test]
+    fn aggregate_weighted_mean_matches_hand_calculation() {
+        // 1 explicit at 0.0 (weight 5) + 2 implicit at 1.0 (weight 1 each)
+        // weighted mean = (5*0 + 1*1 + 1*1) / (5 + 1 + 1) = 2/7
+        let signals = [
+            SignalInput {
+                kind: SignalKind::Explicit,
+                value: 0.0,
+            },
+            SignalInput {
+                kind: SignalKind::Implicit,
+                value: 1.0,
+            },
+            SignalInput {
+                kind: SignalKind::Implicit,
+                value: 1.0,
+            },
+        ];
+        let got = aggregate(&signals, &AggregationConfig::default());
+        assert!((got - 2.0 / 7.0).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn aggregate_single_explicit_dominates_many_implicit() {
+        let signals = [
+            SignalInput {
+                kind: SignalKind::Explicit,
+                value: 0.0,
+            },
+            SignalInput {
+                kind: SignalKind::Implicit,
+                value: 1.0,
+            },
+            SignalInput {
+                kind: SignalKind::Implicit,
+                value: 1.0,
+            },
+            SignalInput {
+                kind: SignalKind::Implicit,
+                value: 1.0,
+            },
+        ];
+        let got = aggregate(&signals, &AggregationConfig::default());
+        // (0*5 + 1*1 + 1*1 + 1*1) / (5+1+1+1) = 3/8 = 0.375, below 0.5 threshold
+        assert!(
+            got < 0.5,
+            "explicit 0.0 should pull aggregate below 0.5, got {got}",
+        );
     }
 }
