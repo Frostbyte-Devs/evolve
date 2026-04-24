@@ -180,19 +180,21 @@ jobs:
         run: |
           set -e
           set -o pipefail
+          # For *new versions of existing crates*, crates.io allows 30 per 10 min,
+          # so a small sleep is enough. For *brand-new crate names*, the limit
+          # is much tighter (5 burst then 1/10min); the workflow will fail there
+          # and the user re-runs --failed, picking up via the already-exists skip.
           for crate in evolve-core evolve-storage evolve-llm evolve-mutators evolve-adapters evolve-proxy evolve-dashboard evolve-cli; do
             echo "=== publishing $crate ==="
             cargo publish -p $crate --no-verify 2>&1 | tee /tmp/publish.log
             RC=${PIPESTATUS[0]}
             if [ $RC -eq 0 ]; then
               echo "--- $crate: published OK ---"
+              sleep 25
             elif grep -q "already exists on crates.io" /tmp/publish.log; then
               echo "--- $crate: already published, skipping ---"
             else
               echo "--- $crate: FAILED (rc=$RC) ---"
               exit 1
             fi
-            # crates.io limits a new account to 5 new crates per 10 minutes, then
-            # 1 per 10 minutes. 620s (a little over 10 min) keeps us under the line.
-            sleep 620
           done
