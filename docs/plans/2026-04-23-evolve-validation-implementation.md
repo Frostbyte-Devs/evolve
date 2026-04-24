@@ -2815,15 +2815,598 @@ cargo llvm-cov --package evolve-core --summary-only  # expect ≥80%
 
 **Goal:** ONE LLM client for ONE purpose: occasionally generating challenger configs.
 
-**Tasks:**
+## Phase 4 Design Decisions (binding for all tasks below)
 
-- 4.1 — Create `crates/evolve-llm/` (Cargo.toml + src/lib.rs).
-- 4.2 — `LlmClient` trait: `async fn complete(prompt: &str, max_tokens: u32) -> Result<String>`.
-- 4.3 — `AnthropicHaikuClient` via reqwest. Reads `ANTHROPIC_API_KEY` env. Retries 1x on transient.
-- 4.4 — `OllamaClient` via async-openai (`base_url` = `http://localhost:11434/v1`). No auth.
-- 4.5 — `pick_default_client()` — tries Ollama first; falls back to Anthropic if key set; returns `Err(NoLlmAvailable)` if neither.
-- 4.6 — Cassette tests for both via `wiremock`. `--ignored` smoke tests against real APIs.
-- 4.7 — Token cost tracker (passive — we just want to log how many cents we've spent, no enforcement at this size).
+- **HTTP client:** `reqwest` (rustls-tls, no OpenSSL). Used for *both* Anthropic and Ollama — we do **not** take `async-openai` (~50 extra deps for a single `POST`).
+- **Ollama endpoint:** `http://localhost:11434/api/chat` (native) — *not* the OpenAI-compat `/v1/chat/completions`. The native endpoint is simpler and documented. No auth.
+- **Anthropic endpoint:** `POST https://api.anthropic.com/v1/messages` with header `anthropic-version: 2023-06-01`.
+- **Model targets:** Haiku = `"claude-haiku-4-5-20251001"` (current latest Haiku per assistant instructions). Ollama model is user-configurable via `OLLAMA_MODEL` env var, default `"qwen2.5-coder:7b"`.
+- **Retry policy:** 1 retry on connection errors, 5xx responses, or 429. No retry on 4xx-except-429. Fixed 500ms backoff (tiny volume — exponential backoff is overkill).
+- **Error type:** crate-local `LlmError` with variants: `NoApiKey`, `Http(reqwest::Error)`, `UnexpectedStatus { status, body }`, `ParseFailure(serde_json::Error)`, `NoLlmAvailable`.
+- **CompletionResult:** `{ text: String, usage: TokenUsage { input: u32, output: u32 } }`. Usage populated from provider's reported token counts; `0` if unknown.
+- **Cassette tests:** `wiremock = "0.6"` — a MockServer stand-in for the provider. Default test suite runs entirely against mocks, zero network. `--ignored` smoke tests hit real providers; not run in default CI.
+- **Cost tracker:** in-memory `CostTracker` with atomic accumulators for total input/output tokens per-model. Price tables hard-coded for Haiku (`$0.25/M in, $1.25/M out`). Ollama = $0. Expose `spent_micro_cents() -> u64` and `log_session()` that emits a `tracing::info!` line. No enforcement.
+
+## Task 4.1 — Crate skeleton + `LlmError`
+
+**Files:**
+- Modify: root `Cargo.toml` (add `reqwest`, `wiremock` to workspace.dependencies; add `"crates/evolve-llm"` to members)
+- Create: `crates/evolve-llm/Cargo.toml`
+- Create: `crates/evolve-llm/src/lib.rs`
+- Create: `crates/evolve-llm/src/error.rs`
+
+**Step 1: Workspace deps — append to root `Cargo.toml`**
+
+```toml
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+wiremock = "0.6"
+```
+
+Add `"crates/evolve-llm"` to `[workspace] members`.
+
+**Step 2: Create `crates/evolve-llm/Cargo.toml`**
+
+```toml
+[package]
+name = "evolve-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal LLM client (Anthropic Haiku + Ollama) for occasional challenger generation"
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
+```
+
+**Step 3: Create `crates/evolve-llm/src/error.rs`**
+
+```rust
+//! Unified error type for the LLM client crate.
+
+use thiserror::Error;
+
+/// Errors produced by LLM clients.
+#[derive(Debug, Error)]
+pub enum LlmError {
+    /// Environment variable `ANTHROPIC_API_KEY` was not set when an Anthropic
+    /// client was requested.
+    #[error("ANTHROPIC_API_KEY not set")]
+    NoApiKey,
+    /// Transport or TLS failure.
+    #[error("http: {0}")]
+    Http(#[from] reqwest::Error),
+    /// Server returned a non-2xx status after retries were exhausted.
+    #[error("unexpected status {status}: {body}")]
+    UnexpectedStatus {
+        /// HTTP status code.
+        status: u16,
+        /// Body snippet (truncated to 512 chars).
+        body: String,
+    },
+    /// Response body did not match the expected schema.
+    #[error("parse: {0}")]
+    ParseFailure(#[from] serde_json::Error),
+    /// Neither Ollama nor Anthropic was reachable / configured.
+    #[error("no llm available")]
+    NoLlmAvailable,
+}
+```
+
+**Step 4: Create `crates/evolve-llm/src/lib.rs`**
+
+```rust
+//! evolve-llm: minimal LLM client for occasional challenger generation.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod error;
+
+pub use error::LlmError;
+```
+
+**Step 5: Verify + commit**
+
+```bash
+cargo check -p evolve-llm
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+git add Cargo.toml Cargo.lock crates/evolve-llm
+git commit -m "feat(llm): scaffold evolve-llm crate with LlmError"
+```
+
+## Task 4.2 — `LlmClient` trait + `CompletionResult`
+
+**Files:**
+- Create: `crates/evolve-llm/src/client.rs`
+- Modify: `crates/evolve-llm/src/lib.rs` (add `pub mod client;` + re-exports)
+
+**Step 1: Define the trait and result types**
+
+`src/client.rs`:
+```rust
+//! The `LlmClient` trait and its shared types.
+
+use crate::error::LlmError;
+use async_trait::async_trait;
+
+/// Token usage reported by the provider. Both fields are 0 if unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Input tokens billed.
+    pub input: u32,
+    /// Output tokens billed.
+    pub output: u32,
+}
+
+/// One completion response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionResult {
+    /// Assistant text.
+    pub text: String,
+    /// Token usage.
+    pub usage: TokenUsage,
+}
+
+/// Shared interface for LLM clients.
+#[async_trait]
+pub trait LlmClient: Send + Sync {
+    /// Run a single non-streaming completion.
+    async fn complete(&self, prompt: &str, max_tokens: u32) -> Result<CompletionResult, LlmError>;
+
+    /// Stable identifier used by the cost tracker price table.
+    fn model_id(&self) -> &str;
+}
+```
+
+**Step 2: Register + test**
+
+In `lib.rs`:
+```rust
+pub mod client;
+pub use client::{CompletionResult, LlmClient, TokenUsage};
+```
+
+Add a trivial test in `client.rs`:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_usage_default_is_zero() {
+        let u = TokenUsage::default();
+        assert_eq!(u.input, 0);
+        assert_eq!(u.output, 0);
+    }
+}
+```
+
+**Step 3: Commit**
+
+```bash
+git commit -m "feat(llm): LlmClient trait with CompletionResult + TokenUsage"
+```
+
+## Task 4.3 — `AnthropicHaikuClient`
+
+**Files:**
+- Create: `crates/evolve-llm/src/anthropic.rs`
+- Modify: `crates/evolve-llm/src/lib.rs`
+
+**Step 1: Write the wiremock cassette test FIRST**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SAMPLE_RESPONSE: &str = r#"{
+        "id": "msg_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5-20251001",
+        "content": [{"type":"text","text":"Hello from mock Haiku"}],
+        "usage": {"input_tokens": 12, "output_tokens": 5}
+    }"#;
+
+    #[tokio::test]
+    async fn happy_path_parses_text_and_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let client = AnthropicHaikuClient::with_endpoint("test-key", server.uri());
+        let got = client.complete("hi", 16).await.unwrap();
+        assert_eq!(got.text, "Hello from mock Haiku");
+        assert_eq!(got.usage.input, 12);
+        assert_eq!(got.usage.output, 5);
+    }
+
+    #[tokio::test]
+    async fn retries_once_on_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+        // First call: 503. Second call: 200.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let client = AnthropicHaikuClient::with_endpoint("test-key", server.uri());
+        let got = client.complete("hi", 16).await.unwrap();
+        assert_eq!(got.text, "Hello from mock Haiku");
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_second_5xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = AnthropicHaikuClient::with_endpoint("test-key", server.uri());
+        let err = client.complete("hi", 16).await.unwrap_err();
+        assert!(matches!(err, LlmError::UnexpectedStatus { status: 503, .. }));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_on_4xx_except_429() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(r#"{"error":"bad"}"#))
+            .expect(1) // exactly one hit — no retry
+            .mount(&server)
+            .await;
+
+        let client = AnthropicHaikuClient::with_endpoint("test-key", server.uri());
+        let err = client.complete("hi", 16).await.unwrap_err();
+        assert!(matches!(err, LlmError::UnexpectedStatus { status: 400, .. }));
+    }
+}
+```
+
+**Step 2: Implement `AnthropicHaikuClient`**
+
+```rust
+//! Anthropic Messages API client, Haiku-only.
+
+use crate::client::{CompletionResult, LlmClient, TokenUsage};
+use crate::error::LlmError;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com";
+const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Minimal client for Anthropic's Messages API, wired for Haiku.
+#[derive(Debug, Clone)]
+pub struct AnthropicHaikuClient {
+    api_key: String,
+    endpoint: String,
+    model: String,
+    http: reqwest::Client,
+}
+
+impl AnthropicHaikuClient {
+    /// Build from the `ANTHROPIC_API_KEY` env var, using the production endpoint.
+    pub fn from_env() -> Result<Self, LlmError> {
+        let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| LlmError::NoApiKey)?;
+        Ok(Self::with_endpoint(key, DEFAULT_ENDPOINT))
+    }
+
+    /// Construct with a caller-supplied endpoint (used by cassette tests).
+    pub fn with_endpoint(api_key: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            endpoint: endpoint.into(),
+            model: DEFAULT_MODEL.to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MessagesRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    messages: Vec<Message<'a>>,
+}
+
+#[derive(Serialize)]
+struct Message<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct MessagesResponse {
+    content: Vec<ContentBlock>,
+    #[serde(default)]
+    usage: Option<UsageReport>,
+}
+
+#[derive(Deserialize)]
+struct ContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsageReport {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+#[async_trait]
+impl LlmClient for AnthropicHaikuClient {
+    async fn complete(&self, prompt: &str, max_tokens: u32) -> Result<CompletionResult, LlmError> {
+        let url = format!("{}/v1/messages", self.endpoint);
+        let body = MessagesRequest {
+            model: &self.model,
+            max_tokens,
+            messages: vec![Message {
+                role: "user",
+                content: prompt,
+            }],
+        };
+
+        for attempt in 0..=1 {
+            let req = self
+                .http
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body);
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let raw = resp.text().await?;
+                        let parsed: MessagesResponse = serde_json::from_str(&raw)?;
+                        let text = parsed
+                            .content
+                            .into_iter()
+                            .filter(|b| b.kind == "text")
+                            .filter_map(|b| b.text)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let usage = parsed
+                            .usage
+                            .map(|u| TokenUsage {
+                                input: u.input_tokens,
+                                output: u.output_tokens,
+                            })
+                            .unwrap_or_default();
+                        return Ok(CompletionResult { text, usage });
+                    }
+                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    if retryable && attempt == 0 {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    let snippet = if body.len() > 512 { &body[..512] } else { &body };
+                    return Err(LlmError::UnexpectedStatus {
+                        status: status.as_u16(),
+                        body: snippet.to_string(),
+                    });
+                }
+                Err(e) if attempt == 0 && e.is_connect() => {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                Err(e) => return Err(LlmError::Http(e)),
+            }
+        }
+        unreachable!("retry loop exits via return")
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+}
+```
+
+**Step 3: Register + test + commit**
+
+```bash
+git commit -m "feat(llm): AnthropicHaikuClient with retry-once on 5xx/429"
+```
+
+## Task 4.4 — `OllamaClient`
+
+**Files:**
+- Create: `crates/evolve-llm/src/ollama.rs`
+
+Similar shape to Anthropic. Endpoint `POST /api/chat`. Request body:
+```json
+{
+  "model": "qwen2.5-coder:7b",
+  "messages": [{"role":"user","content":"..."}],
+  "stream": false,
+  "options": {"num_predict": 128}
+}
+```
+Response:
+```json
+{
+  "model": "qwen2.5-coder:7b",
+  "message": {"role":"assistant","content":"..."},
+  "prompt_eval_count": 12,
+  "eval_count": 5
+}
+```
+
+**Step 1:** Write cassette tests mirroring 4.3 (happy path, retry, 4xx no-retry).
+**Step 2:** Implement with same retry pattern as Anthropic.
+**Step 3:** Commit.
+
+## Task 4.5 — `pick_default_client()`
+
+**Files:**
+- Create: `crates/evolve-llm/src/factory.rs`
+
+**Step 1:** Implement:
+```rust
+/// Select an LLM client: try Ollama first (zero cost, no auth), fall back to
+/// Anthropic Haiku if `ANTHROPIC_API_KEY` is set, else return `NoLlmAvailable`.
+pub async fn pick_default_client() -> Result<Box<dyn LlmClient>, LlmError> {
+    // Cheap reachability probe: GET /api/version on Ollama default port
+    let ollama_url = std::env::var("OLLAMA_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let reachable = reqwest::Client::new()
+        .get(format!("{ollama_url}/api/version"))
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if reachable {
+        return Ok(Box::new(OllamaClient::with_endpoint(ollama_url)));
+    }
+    if let Ok(client) = AnthropicHaikuClient::from_env() {
+        return Ok(Box::new(client));
+    }
+    Err(LlmError::NoLlmAvailable)
+}
+```
+
+**Step 2:** Test with wiremock — both success branches + the `NoLlmAvailable` fall-through.
+**Step 3:** Commit.
+
+## Task 4.6 — `--ignored` smoke tests against real providers
+
+**Files:**
+- Create: `crates/evolve-llm/tests/smoke.rs`
+
+**Step 1:** Write `#[ignore]`-gated tests:
+```rust
+#[tokio::test]
+#[ignore = "requires real Ollama running locally"]
+async fn smoke_ollama_round_trip() { /* ... */ }
+
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY"]
+async fn smoke_anthropic_round_trip() { /* ... */ }
+```
+
+These are developer-invoked, not CI-invoked. Documented in the crate README.
+**Step 2:** Commit.
+
+## Task 4.7 — `CostTracker`
+
+**Files:**
+- Create: `crates/evolve-llm/src/cost.rs`
+
+**Step 1:** Implement:
+```rust
+//! In-memory token cost tracker. Purely observational -- no enforcement.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Price table entry (micro-cents per token).
+#[derive(Debug, Clone, Copy)]
+pub struct Price {
+    /// Micro-cents per input token.
+    pub input_per_token: u64,
+    /// Micro-cents per output token.
+    pub output_per_token: u64,
+}
+
+impl Price {
+    /// Haiku 4.5: $0.25/M input, $1.25/M output => 0.25 / 1_000_000 * 100_000 micro-cents
+    /// per token = 25 micro-cents/M-tokens input, 125 output. Stored scaled up:
+    pub const HAIKU: Self = Self {
+        input_per_token: 25,
+        output_per_token: 125,
+    };
+    /// Ollama is free.
+    pub const OLLAMA: Self = Self {
+        input_per_token: 0,
+        output_per_token: 0,
+    };
+}
+
+/// Accumulates token usage across calls. Thread-safe.
+#[derive(Debug, Default)]
+pub struct CostTracker {
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    micro_cents: AtomicU64,
+}
+
+impl CostTracker {
+    /// Fresh tracker at zero.
+    pub fn new() -> Self { Self::default() }
+
+    /// Record one call's usage. `price` is per-token (see [`Price`]).
+    pub fn record(&self, usage: crate::TokenUsage, price: Price) {
+        self.input_tokens.fetch_add(usage.input as u64, Ordering::Relaxed);
+        self.output_tokens.fetch_add(usage.output as u64, Ordering::Relaxed);
+        let cost = (usage.input as u64) * price.input_per_token
+            + (usage.output as u64) * price.output_per_token;
+        self.micro_cents.fetch_add(cost, Ordering::Relaxed);
+    }
+
+    /// Total spent so far, in micro-cents (1 cent = 100_000 micro-cents? no -
+    /// 1 cent = 10_000 micro-cents given our scaling. Consumer should divide.)
+    pub fn spent_micro_cents(&self) -> u64 {
+        self.micro_cents.load(Ordering::Relaxed)
+    }
+
+    /// Emit a `tracing::info!` line with accumulated cost.
+    pub fn log_session(&self) {
+        let mc = self.spent_micro_cents();
+        let input = self.input_tokens.load(Ordering::Relaxed);
+        let output = self.output_tokens.load(Ordering::Relaxed);
+        tracing::info!(
+            target: "evolve::cost",
+            input_tokens = input,
+            output_tokens = output,
+            micro_cents = mc,
+            "evolve llm usage"
+        );
+    }
+}
+```
+
+**Step 2:** Unit tests: record twice, totals add correctly; Haiku price math matches hand-calc; Ollama records zero cost.
+**Step 3:** Phase 4 verification gates.
+**Step 4:** Commit.
 
 **PHASE 4 COMPLETE.**
 
