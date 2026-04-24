@@ -1,0 +1,23 @@
+[package]
+name = "evolve-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Adapter trait + per-tool integrations (Claude Code, Cursor, Aider)"
+
+[dependencies]
+evolve-core = { path = "../evolve-core" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros"] }
+regex = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }

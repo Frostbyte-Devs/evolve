@@ -361,6 +361,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "evolve-adapters"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "evolve-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "evolve-core"
 version = "0.1.0"
 dependencies = [
