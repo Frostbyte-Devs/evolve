@@ -8,6 +8,7 @@
 
 pub mod agent_configs;
 pub mod error;
+pub mod experiments;
 pub mod pool;
 pub mod projects;
 
