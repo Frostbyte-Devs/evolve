@@ -1,0 +1,17 @@
+[book]
+title = "Evolve"
+authors = ["Kristian Baer"]
+description = "Drop-in passive A/B evolution for AI coding assistants"
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/NORTHTEKDevs/evolve"
+edit-url-template = "https://github.com/NORTHTEKDevs/evolve/edit/main/docs/book/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
