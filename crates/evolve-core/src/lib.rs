@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod agent_config;
 pub mod ids;
 pub mod schema;
 
