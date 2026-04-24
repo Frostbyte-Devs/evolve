@@ -1,0 +1,25 @@
+[package]
+name = "evolve-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core engine for Evolve: genome trait, operators, generation cycle"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
