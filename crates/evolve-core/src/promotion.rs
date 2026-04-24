@@ -80,6 +80,73 @@ fn wins_losses(scores: &[f64]) -> (u32, u32) {
     (wins, losses)
 }
 
+/// Configuration for [`promotion_decision`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromotionConfig {
+    /// Minimum sessions required in each arm before any decision is made.
+    pub min_sessions_per_arm: usize,
+    /// Posterior threshold above which the challenger is promoted.
+    pub promote_threshold: f64,
+    /// Monte Carlo sample count for [`posterior_probability`].
+    pub mc_samples: u32,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        Self {
+            min_sessions_per_arm: 20,
+            promote_threshold: 0.95,
+            mc_samples: 10_000,
+        }
+    }
+}
+
+/// Outcome of a promotion evaluation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decision {
+    /// At least one arm has too few sessions to decide yet.
+    NeedMoreData {
+        /// Sessions in the thinner arm.
+        sessions_each: usize,
+        /// Minimum required per arm.
+        required: usize,
+    },
+    /// Enough data, but posterior below threshold. Keep running.
+    Hold {
+        /// Current estimated `P(challenger > champion)`.
+        posterior: f64,
+    },
+    /// Promote: posterior crossed threshold.
+    Promote {
+        /// Current estimated `P(challenger > champion)`.
+        posterior: f64,
+    },
+}
+
+/// Evaluate whether the challenger should be promoted, held, or needs more data.
+pub fn promotion_decision<R: Rng>(
+    champion_scores: &[f64],
+    challenger_scores: &[f64],
+    config: &PromotionConfig,
+    rng: &mut R,
+) -> Decision {
+    let champ_n = champion_scores.len();
+    let chall_n = challenger_scores.len();
+    if champ_n < config.min_sessions_per_arm || chall_n < config.min_sessions_per_arm {
+        return Decision::NeedMoreData {
+            sessions_each: champ_n.min(chall_n),
+            required: config.min_sessions_per_arm,
+        };
+    }
+    let posterior =
+        posterior_probability(champion_scores, challenger_scores, config.mc_samples, rng);
+    if posterior >= config.promote_threshold {
+        Decision::Promote { posterior }
+    } else {
+        Decision::Hold { posterior }
+    }
+}
+
 /// Monte Carlo estimate of `P(challenger > champion)` under beta-binomial
 /// posteriors: `Beta(1 + wins, 1 + losses)` per arm (uniform Jeffreys-like prior).
 ///
@@ -222,6 +289,42 @@ mod tests {
         let p1 = posterior_probability(&champion, &challenger, 5_000, &mut seeded_rng());
         let p2 = posterior_probability(&champion, &challenger, 5_000, &mut seeded_rng());
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn decision_needs_more_data_when_either_arm_is_thin() {
+        let champion: Vec<f64> = vec![1.0; 5];
+        let challenger: Vec<f64> = vec![0.0; 20];
+        let cfg = PromotionConfig::default();
+        let d = promotion_decision(&champion, &challenger, &cfg, &mut seeded_rng());
+        assert!(matches!(d, Decision::NeedMoreData { .. }));
+    }
+
+    #[test]
+    fn decision_promotes_obvious_winner() {
+        let champion: Vec<f64> = (0..25).map(|i| if i < 5 { 1.0 } else { 0.0 }).collect();
+        let challenger: Vec<f64> = (0..25).map(|i| if i < 23 { 1.0 } else { 0.0 }).collect();
+        let cfg = PromotionConfig::default();
+        let d = promotion_decision(&champion, &challenger, &cfg, &mut seeded_rng());
+        match d {
+            Decision::Promote { posterior } => {
+                assert!(
+                    posterior >= cfg.promote_threshold,
+                    "posterior {posterior} below threshold {}",
+                    cfg.promote_threshold,
+                );
+            }
+            other => panic!("expected Promote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_holds_when_evidence_is_tied() {
+        let champion: Vec<f64> = (0..30).map(|i| if i < 15 { 1.0 } else { 0.0 }).collect();
+        let challenger: Vec<f64> = (0..30).map(|i| if i < 15 { 1.0 } else { 0.0 }).collect();
+        let cfg = PromotionConfig::default();
+        let d = promotion_decision(&champion, &challenger, &cfg, &mut seeded_rng());
+        assert!(matches!(d, Decision::Hold { .. }));
     }
 
     #[test]
