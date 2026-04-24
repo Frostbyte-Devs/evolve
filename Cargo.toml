@@ -4,6 +4,7 @@ members = [
     "crates/evolve-adapters",
     "crates/evolve-cli",
     "crates/evolve-core",
+    "crates/evolve-dashboard",
     "crates/evolve-llm",
     "crates/evolve-mutators",
     "crates/evolve-proxy",
@@ -50,6 +51,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
 
 [profile.release]
 lto = "thin"

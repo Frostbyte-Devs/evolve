@@ -1,0 +1,27 @@
+[package]
+name = "evolve-dashboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local-only web dashboard for Evolve"
+
+[dependencies]
+evolve-core = { path = "../evolve-core" }
+evolve-storage = { path = "../evolve-storage" }
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+tower.workspace = true
