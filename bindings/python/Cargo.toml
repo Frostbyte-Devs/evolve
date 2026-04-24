@@ -1,0 +1,17 @@
+[package]
+name = "evolveai-py"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Python bindings for Evolve (pip install evolveai)"
+
+[lib]
+name = "evolveai"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+evolve-core = { path = "../../crates/evolve-core" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+rand = "0.8"
+rand_chacha = "0.3"

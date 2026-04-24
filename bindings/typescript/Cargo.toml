@@ -1,0 +1,21 @@
+[package]
+name = "evolveai-ts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "TypeScript bindings for Evolve (npm install evolveai)"
+
+[lib]
+name = "evolveai"
+crate-type = ["cdylib"]
+
+[dependencies]
+evolve-core = { path = "../../crates/evolve-core" }
+napi = { version = "2", features = ["napi9"] }
+napi-derive = "2"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[build-dependencies]
+napi-build = "2"

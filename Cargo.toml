@@ -10,7 +10,7 @@ members = [
     "crates/evolve-proxy",
     "crates/evolve-storage",
 ]
-exclude = []
+exclude = ["bindings/python", "bindings/typescript"]
 
 [workspace.package]
 version = "0.1.0"
