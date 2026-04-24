@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/evolve-core"]
+members = ["crates/evolve-core", "crates/evolve-storage"]
 exclude = []
 
 [workspace.package]
@@ -30,6 +30,9 @@ futures = "0.3"
 dashmap = "6.0"
 proptest = "1.5"
 uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+tempfile = "3"
 
 [profile.release]
 lto = "thin"
