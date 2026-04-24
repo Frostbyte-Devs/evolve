@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-24
+
+### Added
+
+- **Claude Code: subagent signal extraction.** Transcript parser now
+  recognizes `"type": "subagent"` events and emits `subagent_ok` (1.0) or
+  `subagent_fail` (0.0) signals, tagged with the subagent type in the
+  payload JSON.
+- **Aider: real test/lint signals.** `AiderAdapter::parse_session` now
+  takes an optional project root and, when given, reads `test-cmd` and
+  `lint-cmd` from `aider.conf.yml` and runs them in that directory with
+  a 60-second timeout. Exit code 0 produces a `*_passed` signal (1.0),
+  anything else `*_failed` (0.0). Timeouts count as failure.
+- **Dashboard: experiments + promotion log.** Two new REST endpoints
+  (`GET /api/projects/:id/experiment` and `.../promotion-log`). The
+  bundled HTML UI now shows the active experiment (champion + challenger
+  config ids, traffic share, start time) and a log of completed
+  experiments with status badges, posterior values, and decision times.
+- **Release pipeline: npm package.** `release.yml` now builds the
+  `bindings/typescript/` napi-rs crate on 4 targets and publishes to npm
+  as `evolveai`. Requires `NPM_TOKEN` secret on the repo.
+
+### Changed
+
+- **Breaking (sessions):** `SessionLog::GitCommit(String)` becomes
+  `SessionLog::GitCommit { sha, project_root: Option<PathBuf> }`. The CLI
+  populates `project_root` from `std::env::current_dir()` so Aider
+  test/lint signals work out of the box.
+
+## [0.1.0-rc.1] - 2026-04-23
+
 ### Added
 
 - **Phase 0:** Cargo workspace skeleton and `evolve-core` stub crate.
