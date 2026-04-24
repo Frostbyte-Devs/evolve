@@ -1,0 +1,21 @@
+[package]
+name = "evolve-mutators"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mutation operators that vary AgentConfig to produce challengers"
+
+[dependencies]
+evolve-core = { path = "../evolve-core" }
+evolve-llm = { path = "../evolve-llm" }
+async-trait.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/evolve-core", "crates/evolve-llm", "crates/evolve-storage"]
+members = [
+    "crates/evolve-core",
+    "crates/evolve-llm",
+    "crates/evolve-mutators",
+    "crates/evolve-storage",
+]
 exclude = []
 
 [workspace.package]

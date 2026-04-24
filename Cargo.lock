@@ -395,6 +395,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "evolve-mutators"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "evolve-core",
+ "evolve-llm",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "evolve-storage"
 version = "0.1.0"
 dependencies = [
