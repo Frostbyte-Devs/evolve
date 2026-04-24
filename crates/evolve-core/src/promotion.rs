@@ -355,3 +355,62 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    fn arb_scores(max_n: usize) -> impl Strategy<Value = Vec<f64>> {
+        prop::collection::vec(prop_oneof![Just(0.0_f64), Just(1.0_f64)], 0..max_n)
+    }
+
+    fn arb_signal() -> impl Strategy<Value = SignalInput> {
+        (prop::bool::ANY, -10.0_f64..10.0_f64).prop_map(|(is_explicit, v)| SignalInput {
+            kind: if is_explicit {
+                SignalKind::Explicit
+            } else {
+                SignalKind::Implicit
+            },
+            value: v,
+        })
+    }
+
+    proptest! {
+        /// `aggregate` always returns a value in `[0.0, 1.0]` for any inputs.
+        #[test]
+        fn aggregate_is_in_unit_interval(
+            signals in prop::collection::vec(arb_signal(), 0..50),
+        ) {
+            let out = aggregate(&signals, &AggregationConfig::default());
+            prop_assert!((0.0..=1.0).contains(&out), "got {out}");
+        }
+
+        /// `promotion_decision` never returns `Promote` with a posterior below threshold.
+        #[test]
+        fn decision_never_promotes_below_threshold(
+            champion in arb_scores(60),
+            challenger in arb_scores(60),
+        ) {
+            let cfg = PromotionConfig::default();
+            let mut r = ChaCha8Rng::seed_from_u64(1);
+            let d = promotion_decision(&champion, &challenger, &cfg, &mut r);
+            if let Decision::Promote { posterior } = d {
+                prop_assert!(posterior >= cfg.promote_threshold);
+            }
+        }
+
+        /// Posterior probability is always in `[0.0, 1.0]`.
+        #[test]
+        fn posterior_is_in_unit_interval(
+            champion in arb_scores(50),
+            challenger in arb_scores(50),
+        ) {
+            let mut r = ChaCha8Rng::seed_from_u64(7);
+            let p = posterior_probability(&champion, &challenger, 1_000, &mut r);
+            prop_assert!((0.0..=1.0).contains(&p), "got {p}");
+        }
+    }
+}
