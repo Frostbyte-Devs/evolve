@@ -17,4 +17,7 @@ pub enum StorageError {
     /// Failed to parse a UUID from a TEXT column.
     #[error("uuid: {0}")]
     Uuid(#[from] uuid::Error),
+    /// Privacy-invariant check tripped: payload looked code-like.
+    #[error("payload rejected: {0}")]
+    PayloadRejected(&'static str),
 }
