@@ -328,6 +328,25 @@ mod tests {
     }
 
     #[test]
+    fn decision_finishes_in_reasonable_time_for_realistic_input() {
+        let champion: Vec<f64> = (0..100).map(|i| if i < 60 { 1.0 } else { 0.0 }).collect();
+        let challenger: Vec<f64> = (0..100).map(|i| if i < 70 { 1.0 } else { 0.0 }).collect();
+        let cfg = PromotionConfig::default();
+        let mut r = seeded_rng();
+
+        let start = std::time::Instant::now();
+        let _ = promotion_decision(&champion, &challenger, &cfg, &mut r);
+        let elapsed = start.elapsed();
+
+        // Generous cap: budget is ~1ms in release, debug builds on slow CI
+        // can swell this 5-10x. Failing here is a real red flag, not a flake.
+        assert!(
+            elapsed.as_millis() < 50,
+            "promotion_decision took {elapsed:?}; expected < 50ms",
+        );
+    }
+
+    #[test]
     fn aggregate_single_explicit_dominates_many_implicit() {
         let signals = [
             SignalInput {
