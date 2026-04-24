@@ -113,24 +113,32 @@ impl Adapter for AiderAdapter {
     }
 
     async fn parse_session(&self, log: SessionLog) -> Result<Vec<ParsedSignal>, AdapterError> {
-        let sha = match log {
-            SessionLog::GitCommit(s) => s,
+        let (sha, project_root) = match log {
+            SessionLog::GitCommit { sha, project_root } => (sha, project_root),
             _ => {
                 return Err(AdapterError::Parse(
                     "aider adapter expects GitCommit log".into(),
                 ));
             }
         };
-        // For v1, the only implicit signal we can reliably derive from a bare
-        // commit SHA is "commit exists + was not reverted within N commits".
-        // Full test/lint signals require runtime config (per-project commands)
-        // — emitted as a single "commit_observed" baseline signal for now.
-        Ok(vec![ParsedSignal {
+
+        let mut signals = vec![ParsedSignal {
             kind: SignalKind::Implicit,
             source: "aider_commit_observed".into(),
             value: 0.5,
             payload_json: Some(format!("{{\"sha\":\"{sha}\"}}")),
-        }])
+        }];
+
+        if let Some(root) = project_root.as_deref() {
+            let cmds = read_aider_cmds(root).await.unwrap_or_default();
+            if let Some(test_cmd) = cmds.test_cmd.as_deref() {
+                signals.push(run_and_signal(root, test_cmd, "aider_tests").await);
+            }
+            if let Some(lint_cmd) = cmds.lint_cmd.as_deref() {
+                signals.push(run_and_signal(root, lint_cmd, "aider_lint").await);
+            }
+        }
+        Ok(signals)
     }
 
     async fn forget(&self, root: &Path) -> Result<(), AdapterError> {
@@ -157,6 +165,72 @@ impl Adapter for AiderAdapter {
             fs::write(&hook, stripped).await?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct AiderCmds {
+    test_cmd: Option<String>,
+    lint_cmd: Option<String>,
+}
+
+/// Read `test-cmd:` and `lint-cmd:` values from `aider.conf.yml`.
+/// Minimal YAML parsing — looks only for `key: value` at column 0.
+async fn read_aider_cmds(root: &Path) -> Option<AiderCmds> {
+    let conf = root.join("aider.conf.yml");
+    if !conf.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&conf).await.ok()?;
+    let mut out = AiderCmds::default();
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("test-cmd:") {
+            out.test_cmd = Some(rest.trim().trim_matches('"').to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("lint-cmd:") {
+            out.lint_cmd = Some(rest.trim().trim_matches('"').to_string());
+        }
+    }
+    Some(out)
+}
+
+/// Run `cmd` in `root` and return a signal based on exit code.
+/// Uses a 60-second timeout; timeouts count as failure.
+async fn run_and_signal(root: &Path, cmd: &str, source_tag: &str) -> ParsedSignal {
+    use tokio::process::Command;
+    use tokio::time::{Duration, timeout};
+
+    let output = timeout(
+        Duration::from_secs(60),
+        if cfg!(windows) {
+            Command::new("cmd")
+                .arg("/C")
+                .arg(cmd)
+                .current_dir(root)
+                .output()
+        } else {
+            Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(root)
+                .output()
+        },
+    )
+    .await;
+
+    let (value, source) = match output {
+        Ok(Ok(o)) if o.status.success() => (1.0, format!("{source_tag}_passed")),
+        Ok(Ok(_)) => (0.0, format!("{source_tag}_failed")),
+        Ok(Err(_)) | Err(_) => (0.0, format!("{source_tag}_error")),
+    };
+    ParsedSignal {
+        kind: SignalKind::Implicit,
+        source,
+        value,
+        payload_json: None,
     }
 }
 
@@ -261,7 +335,10 @@ mod tests {
     #[tokio::test]
     async fn parse_session_emits_commit_observed_signal() {
         let signals = AiderAdapter::new()
-            .parse_session(SessionLog::GitCommit("abc123".into()))
+            .parse_session(SessionLog::GitCommit {
+                sha: "abc123".into(),
+                project_root: None,
+            })
             .await
             .unwrap();
         assert_eq!(signals.len(), 1);

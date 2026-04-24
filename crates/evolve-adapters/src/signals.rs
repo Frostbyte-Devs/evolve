@@ -30,8 +30,16 @@ pub struct ParsedSignal {
 pub enum SessionLog {
     /// A path to a session transcript file (adapter decides how to read it).
     Transcript(PathBuf),
-    /// A git commit SHA (used by Aider post-commit hooks).
-    GitCommit(String),
+    /// A git commit SHA with optional project root (used by Aider post-commit hooks).
+    /// When `project_root` is `Some`, the Aider adapter will run any configured
+    /// `test-cmd` / `lint-cmd` in that directory to produce real signals.
+    GitCommit {
+        /// Commit SHA.
+        sha: String,
+        /// Project root for executing test/lint commands. `None` means
+        /// skip execution and emit only the baseline observation signal.
+        project_root: Option<PathBuf>,
+    },
     /// A pre-parsed event payload (used by the proxy's Cursor fallback).
     ProxyEvent(serde_json::Value),
 }

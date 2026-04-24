@@ -118,7 +118,14 @@ async fn main() -> Result<()> {
             .await
         }
         Command::RecordAider { sha } => {
-            cmd_record(&storage, &registry, "aider", SessionLog::GitCommit(sha)).await
+            let project_root = std::env::current_dir().ok();
+            cmd_record(
+                &storage,
+                &registry,
+                "aider",
+                SessionLog::GitCommit { sha, project_root },
+            )
+            .await
         }
         Command::RecordCursorEvent { event } => {
             let json: serde_json::Value =

@@ -233,6 +233,8 @@ fn strip_managed_section(existing: &str) -> String {
 /// - `{ "type": "user", "text": "/clear" }` → `user_clear` signal (0.0)
 /// - `{ "type": "user", "text": "<feedback>" }` matching regex → `user_feedback`
 /// - `{ "type": "tool_use", "tool": "bash", ..., "exit_code": 0 }` → `tests_passed` if test-like command
+/// - `{ "type": "subagent", "status": "completed"|"errored", "subagent_type": "..." }`
+///   → `subagent_ok`/`subagent_fail` signal tagged with the subagent name
 fn parse_transcript_lines(raw: &str) -> Vec<ParsedSignal> {
     use regex::Regex;
 
@@ -303,6 +305,24 @@ fn parse_transcript_lines(raw: &str) -> Vec<ParsedSignal> {
                     },
                     value: if exit == 0 { 1.0 } else { 0.0 },
                     payload_json: None,
+                });
+            }
+            "subagent" => {
+                let status = event.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let agent = event
+                    .get("subagent_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let (src, val) = match status {
+                    "completed" | "success" => ("subagent_ok", 1.0),
+                    "errored" | "failed" | "timeout" => ("subagent_fail", 0.0),
+                    _ => continue,
+                };
+                signals.push(ParsedSignal {
+                    kind: SignalKind::Implicit,
+                    source: src.to_string(),
+                    value: val,
+                    payload_json: Some(format!("{{\"subagent\":\"{agent}\"}}")),
                 });
             }
             _ => {}
@@ -534,6 +554,36 @@ mod tests {
             .await
             .unwrap();
         assert!(signals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_session_detects_subagent_completion() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            jsonl(&[
+                r#"{"type":"subagent","status":"completed","subagent_type":"code-reviewer"}"#,
+                r#"{"type":"subagent","status":"errored","subagent_type":"debugger"}"#,
+            ]),
+        )
+        .unwrap();
+        let signals = ClaudeCodeAdapter::new()
+            .parse_session(SessionLog::Transcript(path))
+            .await
+            .unwrap();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].source, "subagent_ok");
+        assert_eq!(signals[0].value, 1.0);
+        assert!(
+            signals[0]
+                .payload_json
+                .as_deref()
+                .unwrap()
+                .contains("code-reviewer")
+        );
+        assert_eq!(signals[1].source, "subagent_fail");
+        assert_eq!(signals[1].value, 0.0);
     }
 
     #[tokio::test]
