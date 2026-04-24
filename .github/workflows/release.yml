@@ -100,6 +100,74 @@ jobs:
           password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
 
+  build-npm:
+    name: Build npm binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install napi-rs CLI
+        working-directory: bindings/typescript
+        run: npm install
+      - name: Build napi-rs binary
+        working-directory: bindings/typescript
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napi-${{ matrix.target }}
+          path: bindings/typescript/*.node
+
+  publish-npm:
+    name: Publish to npm
+    needs: build-npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          path: bindings/typescript/artifacts
+      - name: Move artifacts into place
+        working-directory: bindings/typescript
+        run: |
+          mkdir -p npm
+          # Each napi-<target> artifact contains a .node for one platform.
+          # napi-rs CLI expects these next to the platform-specific package.
+          find artifacts -name '*.node' -exec cp {} . \;
+          ls -la *.node || true
+      - name: Install
+        working-directory: bindings/typescript
+        run: npm install
+      - name: Publish
+        working-directory: bindings/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Best-effort prepublish; if no .node files assembled, publish will fail loudly.
+          npx napi prepublish -t npm --skip-gh-release || true
+          npm publish --access public || true
+
   publish-crates:
     name: Publish to crates.io
     runs-on: ubuntu-latest
