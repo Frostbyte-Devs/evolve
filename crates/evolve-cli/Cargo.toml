@@ -1,0 +1,28 @@
+[package]
+name = "evolve-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Evolve CLI — drop-in passive evolution for AI coding assistants"
+
+[[bin]]
+name = "evolve"
+path = "src/main.rs"
+
+[dependencies]
+evolve-adapters = { path = "../evolve-adapters" }
+evolve-core = { path = "../evolve-core" }
+evolve-llm = { path = "../evolve-llm" }
+evolve-storage = { path = "../evolve-storage" }
+clap.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "signal"] }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
