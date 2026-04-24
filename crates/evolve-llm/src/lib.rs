@@ -6,7 +6,9 @@
 pub mod anthropic;
 pub mod client;
 pub mod error;
+pub mod ollama;
 
 pub use anthropic::AnthropicHaikuClient;
 pub use client::{CompletionResult, LlmClient, TokenUsage};
 pub use error::LlmError;
+pub use ollama::OllamaClient;
