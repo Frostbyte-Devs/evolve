@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod agent_configs;
 pub mod error;
 pub mod pool;
 pub mod projects;
