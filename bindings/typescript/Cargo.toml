@@ -7,7 +7,9 @@ license = "Apache-2.0"
 description = "TypeScript bindings for Evolve (npm install evolveai)"
 
 [lib]
-name = "evolveai"
+# napi-rs CLI looks for libevolveai_ts.{so,dylib,dll} (derived from the package
+# name 'evolveai-ts'), so the library name must match.
+name = "evolveai_ts"
 crate-type = ["cdylib"]
 
 [dependencies]
