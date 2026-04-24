@@ -1,20 +1,7 @@
 [workspace]
 resolver = "2"
-members = []
+members = ["crates/evolve-core"]
 exclude = []
-
-[package]
-name = "evolve"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-description.workspace = true
-keywords.workspace = true
-categories.workspace = true
 
 [workspace.package]
 version = "0.1.0"
