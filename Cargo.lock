@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "evolve-adapters"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "evolve-core",
@@ -556,9 +556,10 @@ dependencies = [
 
 [[package]]
 name = "evolve-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "dirs",
@@ -566,8 +567,11 @@ dependencies = [
  "evolve-core",
  "evolve-dashboard",
  "evolve-llm",
+ "evolve-mutators",
  "evolve-proxy",
  "evolve-storage",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
  "reqwest",
  "serde_json",
  "tokio",
@@ -578,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "evolve-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -598,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "evolve-dashboard"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "evolve-core",
@@ -617,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "evolve-llm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -631,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "evolve-mutators"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "evolve-core",
@@ -645,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "evolve-proxy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "reqwest",
@@ -661,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "evolve-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",

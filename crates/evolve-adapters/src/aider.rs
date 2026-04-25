@@ -113,7 +113,7 @@ impl Adapter for AiderAdapter {
     }
 
     async fn parse_session(&self, log: SessionLog) -> Result<Vec<ParsedSignal>, AdapterError> {
-        let (sha, project_root) = match log {
+        let (_sha, project_root) = match log {
             SessionLog::GitCommit { sha, project_root } => (sha, project_root),
             _ => {
                 return Err(AdapterError::Parse(
@@ -122,12 +122,13 @@ impl Adapter for AiderAdapter {
             }
         };
 
-        let mut signals = vec![ParsedSignal {
-            kind: SignalKind::Implicit,
-            source: "aider_commit_observed".into(),
-            value: 0.5,
-            payload_json: Some(format!("{{\"sha\":\"{sha}\"}}")),
-        }];
+        // No baseline signal: emitting a "neutral 0.5" for every commit was
+        // misleading — it pulled the posterior towards 0.5 indefinitely for
+        // users who didn't configure test-cmd / lint-cmd, so experiments
+        // would Hold forever near indifference. Empty signal vec means the
+        // session aggregates to 0.5 (neutral prior) once, which is correct
+        // semantics for "no information".
+        let mut signals = Vec::new();
 
         if let Some(root) = project_root.as_deref() {
             let cmds = read_aider_cmds(root).await.unwrap_or_default();
@@ -333,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_session_emits_commit_observed_signal() {
+    async fn parse_session_with_no_root_emits_no_signals() {
         let signals = AiderAdapter::new()
             .parse_session(SessionLog::GitCommit {
                 sha: "abc123".into(),
@@ -341,15 +342,66 @@ mod tests {
             })
             .await
             .unwrap();
+        // Without a project root we can't run test/lint cmds. Emit nothing
+        // rather than a misleading 0.5 baseline.
+        assert!(signals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_session_runs_test_cmd_when_configured() {
+        let tmp = TempDir::new().unwrap();
+        let ok_cmd = if cfg!(windows) { "exit 0" } else { "true" };
+        std::fs::write(
+            tmp.path().join("aider.conf.yml"),
+            format!("test-cmd: {ok_cmd}\n"),
+        )
+        .unwrap();
+        let signals = AiderAdapter::new()
+            .parse_session(SessionLog::GitCommit {
+                sha: "deadbeef".into(),
+                project_root: Some(tmp.path().to_path_buf()),
+            })
+            .await
+            .unwrap();
         assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].source, "aider_commit_observed");
-        assert!(
-            signals[0]
-                .payload_json
-                .as_deref()
-                .unwrap()
-                .contains("abc123")
-        );
+        assert_eq!(signals[0].source, "aider_tests_passed");
+        assert_eq!(signals[0].value, 1.0);
+    }
+
+    #[tokio::test]
+    async fn parse_session_emits_failed_signal_when_test_cmd_fails() {
+        let tmp = TempDir::new().unwrap();
+        let fail_cmd = if cfg!(windows) { "exit 1" } else { "false" };
+        std::fs::write(
+            tmp.path().join("aider.conf.yml"),
+            format!("test-cmd: {fail_cmd}\n"),
+        )
+        .unwrap();
+        let signals = AiderAdapter::new()
+            .parse_session(SessionLog::GitCommit {
+                sha: "c0ffee".into(),
+                project_root: Some(tmp.path().to_path_buf()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].source, "aider_tests_failed");
+        assert_eq!(signals[0].value, 0.0);
+    }
+
+    #[tokio::test]
+    async fn parse_session_with_no_test_cmd_emits_no_signals() {
+        let tmp = TempDir::new().unwrap();
+        // aider.conf.yml exists but has no test-cmd / lint-cmd.
+        std::fs::write(tmp.path().join("aider.conf.yml"), "model: gpt-4\n").unwrap();
+        let signals = AiderAdapter::new()
+            .parse_session(SessionLog::GitCommit {
+                sha: "abc".into(),
+                project_root: Some(tmp.path().to_path_buf()),
+            })
+            .await
+            .unwrap();
+        assert!(signals.is_empty());
     }
 
     #[tokio::test]

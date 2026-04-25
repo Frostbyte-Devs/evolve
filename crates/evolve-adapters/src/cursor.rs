@@ -54,7 +54,9 @@ impl Adapter for CursorAdapter {
     }
 
     fn detect(&self, root: &Path) -> AdapterDetection {
-        if root.join(".cursorrules").is_file() || root.join(".vscode").is_dir() {
+        // Tighten: .vscode/ alone is too generic (every JS/TS repo has one).
+        // Require .cursorrules OR (.vscode/ AND a Cursor-specific marker).
+        if root.join(".cursorrules").is_file() || root.join(".cursor").is_dir() {
             AdapterDetection::Detected
         } else {
             AdapterDetection::NotDetected

@@ -13,6 +13,18 @@ use evolve_core::promotion::{
 };
 use evolve_llm::LlmClient;
 use evolve_mutators::{MutationCtx, MutatorPicker};
+
+/// Build the mutator picker, omitting LLM-dependent mutators if no LLM is
+/// reachable. Without this, the default 50%-LLM-rewrite weight means roughly
+/// half of all challenger generations would silently fail to mutate anything
+/// when the user has no Anthropic key and no local Ollama.
+pub fn picker_for_environment(has_llm: bool) -> MutatorPicker {
+    if has_llm {
+        MutatorPicker::default()
+    } else {
+        MutatorPicker::without_llm()
+    }
+}
 use evolve_storage::Storage;
 use evolve_storage::agent_configs::{AgentConfigRepo, AgentConfigRow, ConfigRole};
 use evolve_storage::experiments::{Experiment, ExperimentRepo, ExperimentStatus};
@@ -115,10 +127,15 @@ pub async fn promote_challenger(
 /// traffic_share=1.0 (v0.2.0 deploys the challenger full-time and compares
 /// against the historical champion's session population), and apply the
 /// challenger config to disk via the adapter.
-pub async fn generate_challenger(
+///
+/// If `llm` is a `NoOpLlmClient` (or any client that returns
+/// `NoLlmAvailable`), pass a picker built via [`picker_for_environment(false)`]
+/// so we don't pick the LLM-rewrite mutator and silently fail.
+pub async fn generate_challenger_with_picker(
     storage: &Storage,
     registry: &AdapterRegistry,
     llm: &dyn LlmClient,
+    picker: &MutatorPicker,
     project: &Project,
     rng: &mut ChaCha8Rng,
 ) -> Result<(ConfigId, ExperimentId)> {
@@ -130,7 +147,6 @@ pub async fn generate_challenger(
         .await?
         .ok_or_else(|| anyhow!("champion config row missing"))?;
 
-    let picker = MutatorPicker::default();
     let mutator = picker.pick(rng);
     let mut ctx = MutationCtx { llm, rng };
     let challenger_payload = mutator
@@ -174,6 +190,20 @@ pub async fn generate_challenger(
     }
 
     Ok((challenger_id, experiment_id))
+}
+
+/// Convenience wrapper around [`generate_challenger_with_picker`] that uses the
+/// default LLM-aware picker. Callers that may not have an LLM should call
+/// `generate_challenger_with_picker` with `picker_for_environment(false)`.
+pub async fn generate_challenger(
+    storage: &Storage,
+    registry: &AdapterRegistry,
+    llm: &dyn LlmClient,
+    project: &Project,
+    rng: &mut ChaCha8Rng,
+) -> Result<(ConfigId, ExperimentId)> {
+    let picker = MutatorPicker::default();
+    generate_challenger_with_picker(storage, registry, llm, &picker, project, rng).await
 }
 
 /// Default scheduler: trigger challenger generation when enough sessions have

@@ -2,12 +2,14 @@
 
 **Drop-in passive A/B evolution for AI coding assistants.** Install Evolve in any repo, keep using Claude Code / Cursor / Aider exactly the way you already do, and over the next few weeks Evolve quietly learns which prompt prefix, which behavioral rules, which model, and which response style work best for that specific codebase - then promotes the winning configuration automatically.
 
+If anything looks off, run `evolve doctor` and it will tell you what's missing.
+
 - No workflow change. Your AI tool keeps running exactly as before.
 - No cloud. Everything lives in one SQLite file at `~/.evolve/evolve.db`.
 - No telemetry. The only outbound HTTP is the occasional challenger-generation prompt to a provider you choose.
 - About $0.002 per active project per month (or $0 if you point it at a local Ollama).
 
-**Status:** pre-alpha. All 15 planned implementation phases are complete and 125 tests pass, but not a single session from a real user has been observed yet. Expect breakage.
+**Status:** alpha. The end-to-end evolution loop is wired up and proven by integration tests in `crates/evolve-cli/tests/end_to_end.rs` — generating a challenger, running an experiment, computing the Bayesian posterior, and promoting the winner all work. Real-user soak testing has not happened yet, so expect rough edges in implicit signal quality (the regex-based feedback detection in particular).
 
 ## Table of contents
 
@@ -150,7 +152,10 @@ This writes `aider.conf.yml` and installs a git `post-commit` hook that calls `e
 evolve status         # one-liner per project
 evolve list           # all registered projects
 evolve dashboard      # local web UI at http://127.0.0.1:8787
+evolve doctor         # diagnose: hook installed? sessions recorded? LLM reachable?
 ```
+
+If a setup step is broken, `evolve doctor` will tell you exactly which one and how to fix it.
 
 ## What gets installed where
 
@@ -251,7 +256,7 @@ Evolve is designed to be forgettable. `evolve forget --all` removes every trace 
 ## FAQ
 
 **How long before I see my first promotion?**
-Default thresholds need 20 sessions per arm. At 5 sessions/day, expect day 10-20.
+Defaults: 20 sessions before Evolve generates the first challenger; another 20 sessions on the challenger before a promote/hold decision can fire. So plan on around 40 sessions for your first promotion candidate. At 5 sessions/day, that's roughly 8-10 days.
 
 **What if the challenger is obviously worse?**
 The Bayesian posterior pushes down. Experiments that sit below P = 0.05 for a long time become candidates for `evolve abort`.

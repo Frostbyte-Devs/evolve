@@ -160,14 +160,27 @@ jobs:
       - name: Install
         working-directory: bindings/typescript
         run: npm install
+      - name: Skip if NPM_TOKEN not set
+        id: token-check
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "NPM_TOKEN not set — skipping npm publish."
+            echo "publish=false" >> $GITHUB_OUTPUT
+          else
+            echo "publish=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Prepublish (napi)
+        if: steps.token-check.outputs.publish == 'true'
+        working-directory: bindings/typescript
+        run: npx napi prepublish -t npm --skip-gh-release
       - name: Publish
+        if: steps.token-check.outputs.publish == 'true'
         working-directory: bindings/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          # Best-effort prepublish; if no .node files assembled, publish will fail loudly.
-          npx napi prepublish -t npm --skip-gh-release || true
-          npm publish --access public || true
+        run: npm publish --access public
 
   publish-crates:
     name: Publish to crates.io

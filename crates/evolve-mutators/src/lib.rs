@@ -311,6 +311,23 @@ impl Default for MutatorPicker {
 }
 
 impl MutatorPicker {
+    /// Picker with only the four non-LLM mutators. Use when no LLM is
+    /// reachable — without this, ~50% of generations would silently fail.
+    /// Weights are renormalized so the total is unchanged shape:
+    /// behavioral_rules 30, response_style 30, model_pref 20, tool_perms 20.
+    pub fn without_llm() -> Self {
+        Self {
+            entries: vec![
+                (Box::new(BehavioralRulesMutator), 30),
+                (Box::new(ResponseStyleMutator), 30),
+                (Box::new(ModelPrefMutator), 20),
+                (Box::new(ToolPermissionsMutator), 20),
+            ],
+        }
+    }
+}
+
+impl MutatorPicker {
     /// Construct with a custom set of (mutator, weight) entries.
     pub fn new(entries: Vec<(Box<dyn Mutator>, u32)>) -> Self {
         Self { entries }

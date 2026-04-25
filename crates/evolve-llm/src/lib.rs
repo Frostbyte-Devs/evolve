@@ -11,7 +11,7 @@ pub mod factory;
 pub mod ollama;
 
 pub use anthropic::AnthropicHaikuClient;
-pub use client::{CompletionResult, LlmClient, TokenUsage};
+pub use client::{CompletionResult, LlmClient, NoOpLlmClient, TokenUsage};
 pub use cost::{CostTracker, Price};
 pub use error::LlmError;
 pub use factory::pick_default_client;

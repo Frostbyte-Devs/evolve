@@ -31,6 +31,27 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
     fn model_id(&self) -> &str;
 }
 
+/// Placeholder client that always returns `LlmError::NoLlmAvailable`. Used by
+/// callers that need a `&dyn LlmClient` value but know they will never actually
+/// invoke it (e.g., when running only non-LLM mutators).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoOpLlmClient;
+
+#[async_trait]
+impl LlmClient for NoOpLlmClient {
+    async fn complete(
+        &self,
+        _prompt: &str,
+        _max_tokens: u32,
+    ) -> Result<CompletionResult, LlmError> {
+        Err(LlmError::NoLlmAvailable)
+    }
+
+    fn model_id(&self) -> &str {
+        "noop"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

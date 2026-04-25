@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-24
+
+### Added
+
+- **`evolve doctor`** — diagnostic command that walks 8 checks (home dir,
+  database, current project, adapter config files, hook installation,
+  champion config, sessions recorded, experiment status, LLM availability)
+  and reports each as OK / WARN / MISS with a fix hint. Catches the most
+  common reasons evolution isn't happening on a user's machine.
+- **`MutatorPicker::without_llm()`** — returns a picker over only the four
+  rule-based mutators (behavioral_rules, response_style, model_pref,
+  tool_permissions). The CLI now selects between the default and the
+  no-LLM picker based on whether `pick_default_client()` succeeds.
+- **`NoOpLlmClient`** in `evolve-llm` — placeholder client that errors on
+  every call. Used as a `&dyn LlmClient` value when no real LLM is
+  reachable but the API requires a reference.
+
+### Changed
+
+- **AiderAdapter no longer emits a `aider_commit_observed` baseline at
+  0.5.** That signal pulled the posterior toward the indifference point
+  for any user without `test-cmd:` configured, meaning experiments would
+  Hold forever near 0.5. New behavior: emit only real test/lint signals
+  if commands are configured, else emit nothing (session aggregates to
+  the neutral 0.5 prior, which is the correct semantics for "no info").
+- **CursorAdapter detection** no longer treats `.vscode/` as a positive
+  signal — too generic. Now requires `.cursorrules` or `.cursor/`.
+- **`release.yml` npm publish step** is now properly gated on `NPM_TOKEN`
+  presence. Previous version had `|| true` swallowing auth failures and
+  reporting the job green when nothing was actually published.
+
+### Fixed
+
+- **Mutator picker silently dropping ~50% of generations when no LLM.**
+  The default picker has 50% weight on `LlmRewriteMutator`, which would
+  fail with `NoLlmAvailable` for every challenger if neither
+  `ANTHROPIC_API_KEY` nor a local Ollama was reachable. Now the CLI
+  detects LLM availability up front and picks the matching set of
+  mutators, so generations succeed regardless.
+- **README claimed "after ~100 sessions"** but code threshold is 20
+  sessions per arm. Updated to match.
+
 ## [0.2.0] - 2026-04-24
 
 ### Added

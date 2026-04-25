@@ -77,6 +77,8 @@ enum Command {
     },
     /// Force-generate a new challenger now (skip the schedule).
     Roll,
+    /// Diagnose what's stopping evolution from happening.
+    Doctor,
     /// Start the local dashboard (http://127.0.0.1:<port>).
     Dashboard {
         /// TCP port. Default 8787.
@@ -147,6 +149,7 @@ async fn main() -> Result<()> {
             cmd_forget(&storage, &registry, project_id, all).await
         }
         Command::Roll => cmd_roll(&storage, &registry).await,
+        Command::Doctor => cmd_doctor(&storage, &registry, home).await,
         Command::Dashboard { port } => cmd_dashboard(storage, port).await,
         Command::Proxy { adapter, port } => cmd_proxy(&storage, &adapter, port).await,
     }
@@ -364,29 +367,184 @@ async fn cmd_record(
         }
     } else if engine::should_evolve(storage, project.id, 20).await? {
         // 2) No running experiment + threshold reached → spin up a challenger.
-        match evolve_llm::pick_default_client().await {
-            Ok(llm) => {
-                let mut rng = ChaCha8Rng::from_entropy();
-                match engine::generate_challenger(storage, registry, &*llm, &project, &mut rng)
-                    .await
-                {
-                    Ok((cid, eid)) => {
-                        println!("Generated challenger {cid} in experiment {eid}");
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "evolve::engine", "challenger generation failed: {e}")
-                    }
+        // Use whichever picker matches LLM availability. With no LLM the
+        // picker uses only the four rule-based mutators.
+        let mut rng = ChaCha8Rng::from_entropy();
+        let llm_box = evolve_llm::pick_default_client().await.ok();
+        let has_llm = llm_box.is_some();
+        let picker = engine::picker_for_environment(has_llm);
+        let noop = evolve_llm::NoOpLlmClient;
+        let llm: &dyn evolve_llm::LlmClient = match llm_box.as_ref() {
+            Some(b) => b.as_ref(),
+            None => &noop,
+        };
+        match engine::generate_challenger_with_picker(
+            storage, registry, llm, &picker, &project, &mut rng,
+        )
+        .await
+        {
+            Ok((cid, eid)) => {
+                println!("Generated challenger {cid} in experiment {eid}");
+                if !has_llm {
+                    println!(
+                        "(No LLM available — used rule-based mutator only. Set ANTHROPIC_API_KEY or run Ollama locally to enable LlmRewrite mutator.)"
+                    );
                 }
             }
             Err(e) => {
-                tracing::info!(
-                    target: "evolve::engine",
-                    "no LLM available, skipping challenger generation: {e}"
+                tracing::warn!(target: "evolve::engine", "challenger generation failed: {e}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Diagnose every step required for evolution to actually happen on this machine.
+async fn cmd_doctor(storage: &Storage, registry: &AdapterRegistry, home: PathBuf) -> Result<()> {
+    fn ok(label: &str, detail: &str) {
+        println!("[OK]   {label:<32} {detail}");
+    }
+    fn warn(label: &str, detail: &str) {
+        println!("[WARN] {label:<32} {detail}");
+    }
+    fn missing(label: &str, detail: &str) {
+        println!("[MISS] {label:<32} {detail}");
+    }
+    fn info(label: &str, detail: &str) {
+        println!("[INFO] {label:<32} {detail}");
+    }
+
+    println!("Evolve doctor");
+    println!("--------------------------------------------------------");
+
+    ok("evolve home", &home.display().to_string());
+
+    let projects = ProjectRepo::new(storage).list().await?;
+    if projects.is_empty() {
+        missing(
+            "projects registered",
+            "run `evolve init <adapter>` in a project directory",
+        );
+        println!("--------------------------------------------------------");
+        return Ok(());
+    }
+    ok("projects registered", &format!("{}", projects.len()));
+
+    let cwd = std::env::current_dir().ok();
+    let canonical_cwd = cwd
+        .as_deref()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().to_string());
+
+    let current_project = canonical_cwd.as_deref().and_then(|c| {
+        projects
+            .iter()
+            .find(|p| p.root_path == c || p.root_path.to_lowercase() == c.to_lowercase())
+    });
+
+    let project = match current_project {
+        Some(p) => p.clone(),
+        None => {
+            // Fall back to first project so we can still report.
+            warn(
+                "current dir match",
+                "this dir is not a registered project — using most recent",
+            );
+            projects[0].clone()
+        }
+    };
+    ok(
+        "active project",
+        &format!("{} ({})", project.name, project.adapter_id),
+    );
+
+    // Adapter-specific checks.
+    let root = std::path::Path::new(&project.root_path);
+    if let Some(adapter) = registry.get(project.adapter_id.as_str()) {
+        match adapter.detect(root) {
+            evolve_adapters::AdapterDetection::Detected => {
+                ok("adapter config files", "present");
+            }
+            evolve_adapters::AdapterDetection::NotDetected => {
+                warn(
+                    "adapter config files",
+                    "missing — run `evolve init` again to recreate",
                 );
             }
         }
     }
 
+    // Hook installed?
+    let cc_settings = root.join(".claude").join("settings.json");
+    if project.adapter_id.as_str() == "claude-code" {
+        if cc_settings.is_file() {
+            let raw = tokio::fs::read_to_string(&cc_settings)
+                .await
+                .unwrap_or_default();
+            if raw.contains("evolve record-claude-code") {
+                ok("Stop hook installed", ".claude/settings.json");
+            } else {
+                missing(
+                    "Stop hook installed",
+                    "Stop hook not found in settings.json",
+                );
+            }
+        } else {
+            missing("Stop hook installed", ".claude/settings.json missing");
+        }
+    }
+
+    // Champion config + sessions.
+    if let Some(champ_id) = project.champion_config_id {
+        ok("champion config", &champ_id.to_string());
+    } else {
+        missing("champion config", "project has no champion (re-init?)");
+    }
+
+    let session_count = SessionRepo::new(storage)
+        .list_recent(project.id, 9999)
+        .await?
+        .len();
+    let threshold = 20;
+    if session_count >= threshold {
+        ok(
+            "sessions recorded",
+            &format!("{session_count} (>= {threshold} threshold)"),
+        );
+    } else {
+        info(
+            "sessions recorded",
+            &format!(
+                "{session_count} ({} more before challenger generation)",
+                threshold - session_count
+            ),
+        );
+    }
+
+    // Experiment status.
+    if let Some(exp) = evolve_storage::experiments::ExperimentRepo::new(storage)
+        .get_running_for_project(project.id)
+        .await?
+    {
+        ok(
+            "experiment running",
+            &format!("started {}", exp.started_at.to_rfc3339()),
+        );
+    } else {
+        info("experiment running", "none yet");
+    }
+
+    // LLM availability.
+    match evolve_llm::pick_default_client().await {
+        Ok(llm) => ok("LLM available", llm.model_id()),
+        Err(_) => warn(
+            "LLM available",
+            "no Anthropic key + no Ollama on :11434 — only rule-based mutators will run",
+        ),
+    }
+
+    println!("--------------------------------------------------------");
     Ok(())
 }
 
@@ -396,13 +554,25 @@ async fn cmd_roll(storage: &Storage, registry: &AdapterRegistry) -> Result<()> {
         .into_iter()
         .next()
         .context("no projects registered; run `evolve init` first")?;
-    let llm = evolve_llm::pick_default_client()
-        .await
-        .context("no LLM available — set ANTHROPIC_API_KEY or run Ollama locally")?;
     let mut rng = ChaCha8Rng::from_entropy();
-    let (cid, eid) =
-        engine::generate_challenger(storage, registry, &*llm, &project, &mut rng).await?;
+    let llm_box = evolve_llm::pick_default_client().await.ok();
+    let has_llm = llm_box.is_some();
+    let picker = engine::picker_for_environment(has_llm);
+    let noop = evolve_llm::NoOpLlmClient;
+    let llm: &dyn evolve_llm::LlmClient = match llm_box.as_ref() {
+        Some(b) => b.as_ref(),
+        None => &noop,
+    };
+    let (cid, eid) = engine::generate_challenger_with_picker(
+        storage, registry, llm, &picker, &project, &mut rng,
+    )
+    .await?;
     println!("Generated challenger {cid} in experiment {eid}");
+    if !has_llm {
+        println!(
+            "(No LLM detected — used rule-based mutator. Set ANTHROPIC_API_KEY or run Ollama locally for LlmRewrite mutations.)"
+        );
+    }
     Ok(())
 }
 
