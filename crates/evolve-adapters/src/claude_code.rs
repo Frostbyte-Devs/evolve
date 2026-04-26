@@ -12,6 +12,7 @@ use tokio::fs;
 const MANAGED_START: &str = "<!-- evolve:start -->";
 const MANAGED_END: &str = "<!-- evolve:end -->";
 const HOOK_MARKER: &str = "evolve record-claude-code";
+const SESSION_START_MARKER: &str = "evolve session-start";
 
 /// Claude Code integration.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +37,15 @@ impl ClaudeCodeAdapter {
         serde_json::json!({
             "type": "command",
             "command": HOOK_MARKER,
+        })
+    }
+
+    /// Public for tests: build the `SessionStart` hook object that flips the
+    /// deployed variant according to the running experiment's traffic share.
+    pub fn session_start_hook_entry() -> Value {
+        serde_json::json!({
+            "type": "command",
+            "command": SESSION_START_MARKER,
         })
     }
 
@@ -125,6 +135,25 @@ impl Adapter for ClaudeCodeAdapter {
             stop_arr.push(Self::stop_hook_entry());
         }
 
+        // Also install a SessionStart hook so the deployed variant can be
+        // re-rolled per session (proper A/B). Idempotent.
+        let start = hooks_obj
+            .entry("SessionStart".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let start_arr = start
+            .as_array_mut()
+            .ok_or_else(|| AdapterError::Parse("hooks.SessionStart is not an array".into()))?;
+        let start_already = start_arr.iter().any(|entry| {
+            entry
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(|s| s.contains(SESSION_START_MARKER))
+                .unwrap_or(false)
+        });
+        if !start_already {
+            start_arr.push(Self::session_start_hook_entry());
+        }
+
         let rendered = serde_json::to_string_pretty(&settings)?;
         fs::write(&settings_path, rendered).await?;
         Ok(())
@@ -159,18 +188,22 @@ impl Adapter for ClaudeCodeAdapter {
             let raw = fs::read_to_string(&settings_path).await?;
             if !raw.trim().is_empty() {
                 let mut settings: Value = serde_json::from_str(&raw)?;
-                if let Some(stop) = settings
-                    .get_mut("hooks")
-                    .and_then(|h| h.get_mut("Stop"))
-                    .and_then(|s| s.as_array_mut())
-                {
-                    stop.retain(|entry| {
-                        entry
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|s| !s.contains(HOOK_MARKER))
-                            .unwrap_or(true)
-                    });
+                for hook_name in ["Stop", "SessionStart"] {
+                    if let Some(arr) = settings
+                        .get_mut("hooks")
+                        .and_then(|h| h.get_mut(hook_name))
+                        .and_then(|s| s.as_array_mut())
+                    {
+                        arr.retain(|entry| {
+                            entry
+                                .get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|s| {
+                                    !s.contains(HOOK_MARKER) && !s.contains(SESSION_START_MARKER)
+                                })
+                                .unwrap_or(true)
+                        });
+                    }
                 }
                 fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
             }
@@ -184,6 +217,41 @@ impl Adapter for ClaudeCodeAdapter {
             fs::write(&md_path, stripped).await?;
         }
         Ok(())
+    }
+}
+
+/// Helper used by both real-schema and flat-schema user-message parsing to
+/// emit the regex-driven feedback signals.
+fn push_user_text_signals(
+    text: &str,
+    negative: &regex::Regex,
+    positive: &regex::Regex,
+    signals: &mut Vec<ParsedSignal>,
+) {
+    if text.trim() == "/clear" {
+        signals.push(ParsedSignal {
+            kind: SignalKind::Implicit,
+            source: "user_clear".into(),
+            value: 0.0,
+            payload_json: None,
+        });
+        return;
+    }
+    if negative.is_match(text) {
+        signals.push(ParsedSignal {
+            kind: SignalKind::Implicit,
+            source: "user_feedback_negative".into(),
+            value: 0.3,
+            payload_json: None,
+        });
+    }
+    if positive.is_match(text) {
+        signals.push(ParsedSignal {
+            kind: SignalKind::Implicit,
+            source: "user_feedback_positive".into(),
+            value: 0.9,
+            payload_json: None,
+        });
     }
 }
 
@@ -229,12 +297,22 @@ fn strip_managed_section(existing: &str) -> String {
 
 /// Parse a Claude Code transcript (JSONL) into signals.
 ///
-/// Each line is a JSON event. We recognize:
-/// - `{ "type": "user", "text": "/clear" }` → `user_clear` signal (0.0)
-/// - `{ "type": "user", "text": "<feedback>" }` matching regex → `user_feedback`
-/// - `{ "type": "tool_use", "tool": "bash", ..., "exit_code": 0 }` → `tests_passed` if test-like command
-/// - `{ "type": "subagent", "status": "completed"|"errored", "subagent_type": "..." }`
-///   → `subagent_ok`/`subagent_fail` signal tagged with the subagent name
+/// Parse Claude Code transcript JSONL into signals.
+///
+/// Handles two schemas:
+/// 1. **Real Anthropic Claude Code transcript:** events with
+///    `{"type":"user"|"assistant","message":{"role":"...","content": ...}}`
+///    where content is either a string or a list of content blocks
+///    (`text`, `tool_use`, `tool_result`).
+/// 2. **Flat schema** (used by some test fixtures and older transcripts):
+///    `{"type":"user","text":"..."}`, `{"type":"tool_use","tool":"bash","exit_code":N}`.
+///
+/// Both produce the same signal vocabulary:
+/// - `user_clear` (0.0) when `/clear` typed by user
+/// - `user_feedback_positive` (0.9) / `user_feedback_negative` (0.3) by regex
+/// - `tests_passed` (1.0) / `tests_failed` (0.0) by Bash exit code OR is_error
+///   on a `tool_result` paired with a test-like command
+/// - `subagent_ok` (1.0) / `subagent_fail` (0.0) for Task tool invocations
 fn parse_transcript_lines(raw: &str) -> Vec<ParsedSignal> {
     use regex::Regex;
 
@@ -244,7 +322,11 @@ fn parse_transcript_lines(raw: &str) -> Vec<ParsedSignal> {
         Regex::new(r"(?i)\b(cargo test|pytest|npm test|jest|go test|cargo check|cargo clippy)\b")
             .unwrap();
 
+    // Track outstanding Bash tool_use ids so we can correlate their tool_result
+    // (Anthropic transcript schema separates the two).
+    let mut bash_test_ids: std::collections::HashMap<String, ()> = Default::default();
     let mut signals = Vec::new();
+
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -256,34 +338,97 @@ fn parse_transcript_lines(raw: &str) -> Vec<ParsedSignal> {
         let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "user" => {
-                let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                if text.trim() == "/clear" {
-                    signals.push(ParsedSignal {
-                        kind: SignalKind::Implicit,
-                        source: "user_clear".into(),
-                        value: 0.0,
-                        payload_json: None,
-                    });
-                    continue;
+                // Real schema: event.message.content is either a string or a list
+                // of content blocks. Content blocks of type=tool_result indicate
+                // a tool finished.
+                let content = event.pointer("/message/content");
+                if let Some(c) = content {
+                    if let Some(text) = c.as_str() {
+                        push_user_text_signals(text, &negative, &positive, &mut signals);
+                    } else if let Some(arr) = c.as_array() {
+                        for block in arr {
+                            let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if btype == "text" {
+                                let t = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                push_user_text_signals(t, &negative, &positive, &mut signals);
+                            } else if btype == "tool_result" {
+                                let tool_use_id = block
+                                    .get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if !bash_test_ids.contains_key(tool_use_id) {
+                                    continue;
+                                }
+                                let is_error = block
+                                    .get("is_error")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                signals.push(ParsedSignal {
+                                    kind: SignalKind::Implicit,
+                                    source: if !is_error {
+                                        "tests_passed".into()
+                                    } else {
+                                        "tests_failed".into()
+                                    },
+                                    value: if !is_error { 1.0 } else { 0.0 },
+                                    payload_json: None,
+                                });
+                                bash_test_ids.remove(tool_use_id);
+                            }
+                        }
+                    }
+                } else {
+                    // Flat-schema fallback.
+                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    push_user_text_signals(text, &negative, &positive, &mut signals);
                 }
-                if negative.is_match(text) {
-                    signals.push(ParsedSignal {
-                        kind: SignalKind::Implicit,
-                        source: "user_feedback_negative".into(),
-                        value: 0.3,
-                        payload_json: None,
-                    });
-                }
-                if positive.is_match(text) {
-                    signals.push(ParsedSignal {
-                        kind: SignalKind::Implicit,
-                        source: "user_feedback_positive".into(),
-                        value: 0.9,
-                        payload_json: None,
-                    });
+            }
+            "assistant" => {
+                // Real schema: event.message.content is a list of blocks; we look
+                // for tool_use blocks calling Bash with a test-like command, plus
+                // Task tool calls (subagents).
+                if let Some(arr) = event.pointer("/message/content").and_then(|c| c.as_array()) {
+                    for block in arr {
+                        let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if btype != "tool_use" {
+                            continue;
+                        }
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if name.eq_ignore_ascii_case("bash") {
+                            let cmd = block
+                                .pointer("/input/command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if test_cmd.is_match(cmd) {
+                                bash_test_ids.insert(id, ());
+                            }
+                        } else if name == "Task" {
+                            let agent = block
+                                .pointer("/input/subagent_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            // Subagent outcomes arrive in the next user/tool_result;
+                            // mark as observed for now via a neutral 0.5 if we never
+                            // see the result. The real-schema test_passed/failed
+                            // covers the bash case; for Task we emit a baseline OK
+                            // so users can see it fired.
+                            signals.push(ParsedSignal {
+                                kind: SignalKind::Implicit,
+                                source: "subagent_invoked".into(),
+                                value: 0.5,
+                                payload_json: Some(format!("{{\"subagent\":\"{agent}\"}}")),
+                            });
+                        }
+                    }
                 }
             }
             "tool_use" => {
+                // Flat-schema fallback.
                 let tool = event.get("tool").and_then(|v| v.as_str()).unwrap_or("");
                 if tool != "bash" {
                     continue;
@@ -308,6 +453,7 @@ fn parse_transcript_lines(raw: &str) -> Vec<ParsedSignal> {
                 });
             }
             "subagent" => {
+                // Flat-schema fallback for explicit subagent events.
                 let status = event.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 let agent = event
                     .get("subagent_type")
@@ -584,6 +730,77 @@ mod tests {
         );
         assert_eq!(signals[1].source, "subagent_fail");
         assert_eq!(signals[1].value, 0.0);
+    }
+
+    #[tokio::test]
+    async fn parse_session_handles_real_anthropic_schema() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("real.jsonl");
+        std::fs::write(
+            &path,
+            jsonl(&[
+                // user with text-block content
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"thanks, looks good"}]}}"#,
+                // assistant invoking Bash with cargo test
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+                // user message containing the tool_result for that bash call
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"ok","is_error":false}]}}"#,
+            ]),
+        )
+        .unwrap();
+        let signals = ClaudeCodeAdapter::new()
+            .parse_session(SessionLog::Transcript(path))
+            .await
+            .unwrap();
+        let sources: Vec<&str> = signals.iter().map(|s| s.source.as_str()).collect();
+        assert!(sources.contains(&"user_feedback_positive"));
+        assert!(sources.contains(&"tests_passed"));
+    }
+
+    #[tokio::test]
+    async fn parse_session_real_schema_failed_test_emits_failed() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("realfail.jsonl");
+        std::fs::write(
+            &path,
+            jsonl(&[
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_99","name":"Bash","input":{"command":"pytest"}}]}}"#,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_99","content":"FAILED","is_error":true}]}}"#,
+            ]),
+        )
+        .unwrap();
+        let signals = ClaudeCodeAdapter::new()
+            .parse_session(SessionLog::Transcript(path))
+            .await
+            .unwrap();
+        let sources: Vec<&str> = signals.iter().map(|s| s.source.as_str()).collect();
+        assert!(sources.contains(&"tests_failed"));
+    }
+
+    #[tokio::test]
+    async fn parse_session_real_schema_task_subagent_invocation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("subagent.jsonl");
+        std::fs::write(
+            &path,
+            jsonl(&[
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"task_01","name":"Task","input":{"subagent_type":"code-reviewer","prompt":"review"}}]}}"#,
+            ]),
+        )
+        .unwrap();
+        let signals = ClaudeCodeAdapter::new()
+            .parse_session(SessionLog::Transcript(path))
+            .await
+            .unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].source, "subagent_invoked");
+        assert!(
+            signals[0]
+                .payload_json
+                .as_deref()
+                .unwrap()
+                .contains("code-reviewer")
+        );
     }
 
     #[tokio::test]

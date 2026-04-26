@@ -70,16 +70,55 @@
         }
 
         async function fetchProjectDetail(project) {
-            const [exp, promotionLog, sessions] = await Promise.all([
+            const [exp, promotionLog, sessions, successRate] = await Promise.all([
                 fetch(`/api/projects/${project.id}/experiment`).then(r => r.json()).catch(() => null),
                 fetch(`/api/projects/${project.id}/promotion-log`).then(r => r.json()).catch(() => []),
                 fetch(`/api/projects/${project.id}/sessions`).then(r => r.json()).catch(() => []),
+                fetch(`/api/projects/${project.id}/success-rate`).then(r => r.json()).catch(() => []),
             ]);
-            return { project, exp, promotionLog, sessions };
+            return { project, exp, promotionLog, sessions, successRate };
+        }
+
+        function renderSuccessRate(buckets) {
+            if (!buckets || !buckets.length) {
+                return '<h2>Success rate over time</h2><div class="empty">Need at least one session.</div>';
+            }
+            // Group by variant.
+            const byVariant = {};
+            for (const b of buckets) {
+                (byVariant[b.variant] ||= []).push(b);
+            }
+            // Compute per-variant overall mean for the headline.
+            const overall = Object.entries(byVariant).map(([variant, rows]) => {
+                const totalSessions = rows.reduce((s, r) => s + r.session_count, 0);
+                const weightedMean = rows.reduce((s, r) => s + r.mean_score * r.session_count, 0) / Math.max(totalSessions, 1);
+                return { variant, totalSessions, weightedMean };
+            });
+            const headline = overall.map(o =>
+                `<span class="badge ${o.variant === 'champion' ? 'badge-promoted' : 'badge-running'}">${o.variant}</span> ` +
+                `${(o.weightedMean * 100).toFixed(1)}% over ${o.totalSessions} sessions`
+            ).join(' &nbsp; ');
+            // Quick sparkline-ish display per variant.
+            const lines = Object.entries(byVariant).map(([variant, rows]) => {
+                const cells = rows.map(r => {
+                    const w = Math.max(2, Math.round(r.session_count));
+                    const c = r.mean_score >= 0.5 ? '#7fe07f' : '#ff8080';
+                    const opacity = Math.min(1, r.session_count / 5).toFixed(2);
+                    return `<span style="display:inline-block;width:${w * 4}px;height:${(r.mean_score * 30) + 2}px;background:${c};opacity:${opacity};margin-right:1px;vertical-align:bottom;" title="${r.date} ${variant}: ${(r.mean_score * 100).toFixed(0)}% (${r.session_count} sessions)"></span>`;
+                }).join('');
+                return `<div class="meta">${variant}:<br>${cells}</div>`;
+            }).join('<div style="height:0.5rem;"></div>');
+            return `
+                <h2>Success rate over time</h2>
+                <div class="experiment">
+                    <div>${headline}</div>
+                    <div style="margin-top:0.75rem;">${lines}</div>
+                </div>
+            `;
         }
 
         function renderProject(detail) {
-            const { project, exp, promotionLog, sessions } = detail;
+            const { project, exp, promotionLog, sessions, successRate } = detail;
             const expHtml = exp ? `
                 <h2>Active experiment</h2>
                 <div class="experiment">
@@ -112,6 +151,7 @@
                     <div class="project-header">${project.name}</div>
                     <div class="meta">${project.adapter_id} · ${project.root_path}</div>
                     <div class="meta">Created ${fmtDate(project.created_at)} · champion <code>${project.champion_config_id || '—'}</code></div>
+                    ${renderSuccessRate(successRate)}
                     ${expHtml}
                     ${logHtml}
                     ${sessionsHtml}

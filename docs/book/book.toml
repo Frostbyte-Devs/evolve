@@ -3,7 +3,6 @@ title = "Evolve"
 authors = ["Kristian Baer"]
 description = "Drop-in passive A/B evolution for AI coding assistants"
 language = "en"
-multilingual = false
 src = "src"
 
 [output.html]

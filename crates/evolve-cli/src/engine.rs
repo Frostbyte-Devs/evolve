@@ -124,9 +124,9 @@ pub async fn promote_challenger(
 
 /// Generate a challenger from the current champion using one mutator, persist
 /// it as an AgentConfig row with role=Challenger, start a new Experiment with
-/// traffic_share=1.0 (v0.2.0 deploys the challenger full-time and compares
-/// against the historical champion's session population), and apply the
-/// challenger config to disk via the adapter.
+/// traffic_share=0.5 (proper A/B — half of new sessions go to each variant,
+/// decided by the SessionStart hook), and apply the challenger config to disk
+/// via the adapter as the initial deployment for the next session.
 ///
 /// If `llm` is a `NoOpLlmClient` (or any client that returns
 /// `NoLlmAvailable`), pass a picker built via [`picker_for_environment(false)`]
@@ -175,7 +175,7 @@ pub async fn generate_challenger_with_picker(
             champion_config_id: champion_id,
             challenger_config_id: challenger_id,
             status: ExperimentStatus::Running,
-            traffic_share: 1.0,
+            traffic_share: 0.5,
             started_at: Utc::now(),
             decided_at: None,
             decision_posterior: None,
@@ -228,16 +228,25 @@ pub async fn should_evolve(
 }
 
 /// Figure out which variant + config_id a new session should be tagged with.
-/// If an experiment is running: challenger variant on the challenger config.
-/// Otherwise: champion variant on the project's champion config.
+///
+/// 1. If a per-project deployment-state file exists from a SessionStart hook
+///    that just ran, use that — it tells us exactly which variant was deployed
+///    for this session.
+/// 2. Otherwise: if an experiment is running, mark as challenger (full traffic
+///    fallback); else champion. This path is hit when Claude Code's
+///    SessionStart hook didn't fire.
 pub async fn resolve_active_deployment(
     storage: &Storage,
     project: &Project,
+    home: &std::path::Path,
 ) -> Result<(
     evolve_storage::sessions::SessionVariant,
     ConfigId,
     Option<ExperimentId>,
 )> {
+    if let Some(state) = read_deployment_state(home, project.id).await? {
+        return Ok((state.variant, state.config_id, state.experiment_id));
+    }
     if let Some(exp) = ExperimentRepo::new(storage)
         .get_running_for_project(project.id)
         .await?
@@ -256,4 +265,113 @@ pub async fn resolve_active_deployment(
         champ,
         None,
     ))
+}
+
+/// What was deployed at the start of the most recent session.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeploymentState {
+    /// Project this state belongs to.
+    pub project_id: ProjectId,
+    /// Variant deployed.
+    pub variant: evolve_storage::sessions::SessionVariant,
+    /// Config row id for the deployed variant.
+    pub config_id: ConfigId,
+    /// Experiment id if the deployment was an A/B arm.
+    pub experiment_id: Option<ExperimentId>,
+    /// When the deployment happened (RFC3339).
+    pub deployed_at: String,
+}
+
+fn deployment_state_path(home: &std::path::Path, project_id: ProjectId) -> std::path::PathBuf {
+    home.join("state").join(format!("{}.json", project_id))
+}
+
+/// Read deployment state for a project, if any.
+pub async fn read_deployment_state(
+    home: &std::path::Path,
+    project_id: ProjectId,
+) -> Result<Option<DeploymentState>> {
+    let p = deployment_state_path(home, project_id);
+    if !p.is_file() {
+        return Ok(None);
+    }
+    let raw = tokio::fs::read_to_string(&p).await?;
+    let state: DeploymentState = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(state))
+}
+
+/// Write deployment state for a project.
+pub async fn write_deployment_state(home: &std::path::Path, state: &DeploymentState) -> Result<()> {
+    let p = deployment_state_path(home, state.project_id);
+    if let Some(parent) = p.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&p, serde_json::to_string_pretty(state)?).await?;
+    Ok(())
+}
+
+/// Decide which variant to deploy for a fresh session, apply that variant's
+/// config to disk via the adapter, and persist the choice in the project's
+/// deployment-state file.
+pub async fn handle_session_start(
+    storage: &Storage,
+    registry: &AdapterRegistry,
+    project: &Project,
+    home: &std::path::Path,
+    rng: &mut ChaCha8Rng,
+) -> Result<DeploymentState> {
+    use rand::Rng;
+
+    let exp = ExperimentRepo::new(storage)
+        .get_running_for_project(project.id)
+        .await?;
+
+    let (variant, config_id, experiment_id) = if let Some(e) = exp {
+        let to_challenger: bool = rng.gen_bool(e.traffic_share);
+        if to_challenger {
+            (
+                evolve_storage::sessions::SessionVariant::Challenger,
+                e.challenger_config_id,
+                Some(e.id),
+            )
+        } else {
+            (
+                evolve_storage::sessions::SessionVariant::Champion,
+                e.champion_config_id,
+                Some(e.id),
+            )
+        }
+    } else {
+        (
+            evolve_storage::sessions::SessionVariant::Champion,
+            project
+                .champion_config_id
+                .ok_or_else(|| anyhow!("project has no champion"))?,
+            None,
+        )
+    };
+
+    let cfg_row = AgentConfigRepo::new(storage)
+        .get_by_id(config_id)
+        .await?
+        .ok_or_else(|| anyhow!("config row missing for deployment"))?;
+    if let Some(adapter) = registry.get(project.adapter_id.as_str()) {
+        adapter
+            .apply_config(Path::new(&project.root_path), &cfg_row.payload)
+            .await
+            .context("adapter apply_config in session start")?;
+    }
+
+    let state = DeploymentState {
+        project_id: project.id,
+        variant,
+        config_id,
+        experiment_id,
+        deployed_at: Utc::now().to_rfc3339(),
+    };
+    write_deployment_state(home, &state).await?;
+    Ok(state)
 }

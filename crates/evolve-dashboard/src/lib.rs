@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{id}/promotion-log",
             get(project_promotion_log),
         )
+        .route("/api/projects/{id}/success-rate", get(project_success_rate))
         .route("/healthz", get(|| async { "ok" }))
         .fallback(static_handler)
         .with_state(state)
@@ -188,6 +189,74 @@ async fn project_promotion_log(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Per-project success-rate-over-time metric. Returns one bucket per
+/// (date, variant) with the mean session aggregate score for that bucket.
+/// This is the killer metric: "is the new champion actually better than the
+/// old one?" — answered with a line chart.
+async fn project_success_rate(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    use evolve_core::promotion::{
+        AggregationConfig, SignalInput, SignalKind as PromSignalKind, aggregate,
+    };
+    use evolve_storage::signals::{SignalKind as StorageSignalKind, SignalRepo};
+    use std::collections::BTreeMap;
+
+    let pid = match uuid::Uuid::parse_str(&id).map(evolve_core::ids::ProjectId::from_uuid) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let sessions = match SessionRepo::new(&state.storage)
+        .list_recent(pid, 5_000)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let cfg = AggregationConfig::default();
+    let signal_repo = SignalRepo::new(&state.storage);
+
+    // (date_string, variant) -> Vec<aggregated_score>
+    let mut buckets: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    for sess in sessions {
+        let date = sess.started_at.format("%Y-%m-%d").to_string();
+        let variant = format!("{:?}", sess.variant).to_lowercase();
+        let sigs = match signal_repo.list_for_session(sess.id).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let inputs: Vec<SignalInput> = sigs
+            .into_iter()
+            .map(|s| SignalInput {
+                kind: match s.kind {
+                    StorageSignalKind::Explicit => PromSignalKind::Explicit,
+                    StorageSignalKind::Implicit => PromSignalKind::Implicit,
+                },
+                value: s.value,
+            })
+            .collect();
+        let score = aggregate(&inputs, &cfg);
+        buckets.entry((date, variant)).or_default().push(score);
+    }
+
+    let series: Vec<_> = buckets
+        .into_iter()
+        .map(|((date, variant), scores)| {
+            let n = scores.len();
+            let mean = scores.iter().sum::<f64>() / (n as f64).max(1.0);
+            json!({
+                "date": date,
+                "variant": variant,
+                "session_count": n,
+                "mean_score": mean,
+            })
+        })
+        .collect();
+    Json(series).into_response()
 }
 
 async fn project_sessions(

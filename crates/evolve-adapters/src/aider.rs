@@ -132,11 +132,12 @@ impl Adapter for AiderAdapter {
 
         if let Some(root) = project_root.as_deref() {
             let cmds = read_aider_cmds(root).await.unwrap_or_default();
+            let to = resolve_timeout(&cmds);
             if let Some(test_cmd) = cmds.test_cmd.as_deref() {
-                signals.push(run_and_signal(root, test_cmd, "aider_tests").await);
+                signals.push(run_and_signal(root, test_cmd, "aider_tests", to).await);
             }
             if let Some(lint_cmd) = cmds.lint_cmd.as_deref() {
-                signals.push(run_and_signal(root, lint_cmd, "aider_lint").await);
+                signals.push(run_and_signal(root, lint_cmd, "aider_lint", to).await);
             }
         }
         Ok(signals)
@@ -173,10 +174,16 @@ impl Adapter for AiderAdapter {
 struct AiderCmds {
     test_cmd: Option<String>,
     lint_cmd: Option<String>,
+    /// Per-project timeout override (seconds). `None` means use the
+    /// `EVOLVE_AIDER_TIMEOUT_SECS` env var, falling back to 300s.
+    timeout_secs: Option<u64>,
 }
 
-/// Read `test-cmd:` and `lint-cmd:` values from `aider.conf.yml`.
-/// Minimal YAML parsing — looks only for `key: value` at column 0.
+const DEFAULT_AIDER_TIMEOUT_SECS: u64 = 300;
+
+/// Read `test-cmd:` and `lint-cmd:` and `evolve-timeout-secs:` values from
+/// `aider.conf.yml`. Minimal YAML parsing — looks only for `key: value` at
+/// column 0.
 async fn read_aider_cmds(root: &Path) -> Option<AiderCmds> {
     let conf = root.join("aider.conf.yml");
     if !conf.is_file() {
@@ -193,19 +200,41 @@ async fn read_aider_cmds(root: &Path) -> Option<AiderCmds> {
             out.test_cmd = Some(rest.trim().trim_matches('"').to_string());
         } else if let Some(rest) = trimmed.strip_prefix("lint-cmd:") {
             out.lint_cmd = Some(rest.trim().trim_matches('"').to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("evolve-timeout-secs:") {
+            if let Ok(n) = rest.trim().parse::<u64>() {
+                out.timeout_secs = Some(n);
+            }
         }
     }
     Some(out)
 }
 
+fn resolve_timeout(cmds: &AiderCmds) -> u64 {
+    if let Some(t) = cmds.timeout_secs {
+        return t;
+    }
+    if let Ok(s) = std::env::var("EVOLVE_AIDER_TIMEOUT_SECS") {
+        if let Ok(n) = s.parse::<u64>() {
+            return n;
+        }
+    }
+    DEFAULT_AIDER_TIMEOUT_SECS
+}
+
 /// Run `cmd` in `root` and return a signal based on exit code.
-/// Uses a 60-second timeout; timeouts count as failure.
-async fn run_and_signal(root: &Path, cmd: &str, source_tag: &str) -> ParsedSignal {
+/// Timeout: `evolve-timeout-secs:` in aider.conf.yml, else
+/// `EVOLVE_AIDER_TIMEOUT_SECS` env var, else 300s. Timeouts count as error.
+async fn run_and_signal(
+    root: &Path,
+    cmd: &str,
+    source_tag: &str,
+    timeout_secs: u64,
+) -> ParsedSignal {
     use tokio::process::Command;
     use tokio::time::{Duration, timeout};
 
     let output = timeout(
-        Duration::from_secs(60),
+        Duration::from_secs(timeout_secs),
         if cfg!(windows) {
             Command::new("cmd")
                 .arg("/C")

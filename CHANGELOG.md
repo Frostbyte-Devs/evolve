@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-25
+
+### Added
+
+- **Real per-session A/B deployment.** New `SessionStart` hook installed
+  by `ClaudeCodeAdapter::install` calls `evolve session-start`, which
+  Bernoulli-flips on the running experiment's `traffic_share` (default
+  0.5), applies the chosen variant's config to disk, and writes the
+  decision to `~/.evolve/state/<project_id>.json`. Stop hook then reads
+  that file to tag the session correctly. Replaces the v0.2 hack of
+  deploying challenger at 100% traffic and comparing against historical
+  champion sessions — this is the actual A/B test design from the
+  whitepaper now wired up.
+- **`evolve session-start`** CLI subcommand (typically called only by
+  the hook, but available manually).
+- **Dashboard: success-rate-over-time** at `/api/projects/:id/success-rate`
+  + a stacked-bar UI panel showing per-day, per-variant mean session
+  scores. The headline number is "X% over N sessions" per variant —
+  the metric a user actually wants to see to know if evolution is
+  working for them.
+- **Configurable Aider timeout.** Default raised from 60s to 300s.
+  Override per-project via `evolve-timeout-secs:` in `aider.conf.yml`,
+  or globally via `EVOLVE_AIDER_TIMEOUT_SECS` env var.
+- **Soak test (`tests/soak.rs`).** Inserts 10 000 sessions through the
+  full storage stack and verifies < 120s wall time. On a typical laptop
+  release-mode it runs in ~1.4s — confirms storage scales fine for
+  multi-month projects.
+- **Real Anthropic Claude Code transcript schema.** Parser now handles
+  the live transcript format (`message.content[]` blocks of types
+  `text` / `tool_use` / `tool_result`) in addition to the simplified
+  flat schema used in older test fixtures. Subagent (Task tool)
+  invocations emit `subagent_invoked` signals.
+- **Timeline doc chapter** at `docs/book/src/timeline.md` walking
+  users through realistic day-by-day expectations from install through
+  first promotion.
+
+### Changed
+
+- **Default experiment `traffic_share` is 0.5** (was 1.0). Real A/B test.
+- **`engine::resolve_active_deployment`** now takes an `EVOLVE_HOME`
+  path arg and prefers the deployment-state file over inferring from
+  experiment state. Reflects the v0.3 SessionStart-driven design.
+
+### Fixed
+
+- `book.toml` had a deprecated `multilingual` key that prevented mdBook
+  from building; removed.
+
 ## [0.2.1] - 2026-04-24
 
 ### Added

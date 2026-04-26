@@ -77,6 +77,9 @@ enum Command {
     },
     /// Force-generate a new challenger now (skip the schedule).
     Roll,
+    /// Hook entry point: pick a variant for the new session and deploy it.
+    /// Called by the Claude Code `SessionStart` hook. Not typically run by hand.
+    SessionStart,
     /// Diagnose what's stopping evolution from happening.
     Doctor,
     /// Start the local dashboard (http://127.0.0.1:<port>).
@@ -149,10 +152,54 @@ async fn main() -> Result<()> {
             cmd_forget(&storage, &registry, project_id, all).await
         }
         Command::Roll => cmd_roll(&storage, &registry).await,
+        Command::SessionStart => cmd_session_start(&storage, &registry, home).await,
         Command::Doctor => cmd_doctor(&storage, &registry, home).await,
         Command::Dashboard { port } => cmd_dashboard(storage, port).await,
         Command::Proxy { adapter, port } => cmd_proxy(&storage, &adapter, port).await,
     }
+}
+
+/// Helper: read EVOLVE_HOME or default. Used by cmd_record which doesn't
+/// receive the `home` PathBuf directly.
+fn resolve_home_for_record() -> Result<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("EVOLVE_HOME") {
+        return Ok(p.into());
+    }
+    let home = dirs::home_dir().context("no home directory")?;
+    Ok(home.join(".evolve"))
+}
+
+async fn cmd_session_start(
+    storage: &Storage,
+    registry: &AdapterRegistry,
+    home: PathBuf,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?
+        .canonicalize()
+        .unwrap_or(std::env::current_dir()?);
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let project_repo = ProjectRepo::new(storage);
+    let projects = project_repo.list().await?;
+    let project = projects
+        .into_iter()
+        .find(|p| p.root_path == cwd_str || p.root_path.eq_ignore_ascii_case(&cwd_str));
+    let Some(project) = project else {
+        // Hook fires for every Claude Code session globally; if this dir
+        // isn't an evolve project, exit silently rather than failing the hook.
+        return Ok(());
+    };
+
+    let mut rng = ChaCha8Rng::from_entropy();
+    let state = engine::handle_session_start(storage, registry, &project, &home, &mut rng).await?;
+    println!(
+        "evolve: deployed {} ({})",
+        match state.variant {
+            evolve_storage::sessions::SessionVariant::Champion => "champion",
+            evolve_storage::sessions::SessionVariant::Challenger => "challenger",
+        },
+        state.config_id,
+    );
+    Ok(())
 }
 
 async fn cmd_dashboard(storage: Storage, port: u16) -> Result<()> {
@@ -301,8 +348,11 @@ async fn cmd_record(
         .context("no projects registered for this adapter; run `evolve init` first")?;
 
     // Resolve which variant + config + experiment this session belongs to.
+    // Prefer the state file written by SessionStart; fall back to current
+    // experiment status if the hook didn't run.
+    let home = resolve_home_for_record()?;
     let (variant, config_id, experiment_id) =
-        engine::resolve_active_deployment(storage, &project).await?;
+        engine::resolve_active_deployment(storage, &project, &home).await?;
 
     let parsed = adapter.parse_session(log).await?;
 

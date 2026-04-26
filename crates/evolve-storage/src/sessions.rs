@@ -7,7 +7,8 @@ use evolve_core::ids::{ConfigId, ExperimentId, ProjectId, SessionId};
 use uuid::Uuid;
 
 /// Which variant was active when this session ran.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SessionVariant {
     /// The project's champion config was applied.
     Champion,
